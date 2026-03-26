@@ -3,3 +3,4 @@
 # Documentation managed outside git
 docs/superpowers/
 *.md
+!README.md
