@@ -1,6 +1,6 @@
 # GCode-Sentinel -- Implementation Roadmap
 
-**Baseline:** v1.0 complete (58 tests, 0 warnings). Parser, analyzer, optimizer (5 rules), emitter, CLI pipeline all functional.
+**Baseline:** v2.0 complete (76 tests, 0 warnings). CI/CD, integration tests against real OrcaSlicer files, JSON report output, post-opt re-analysis safety gate all implemented.
 **Date:** 2026-03-26
 **Audience:** Contributors implementing these features.
 
@@ -10,7 +10,7 @@
 
 | Version | Theme | Milestone |
 |---------|-------|-----------|
-| **v2.0** | Foundations and Integration Testing | CI/CD, integration tests against real OrcaSlicer files, `--report-file`, JSON output |
+| ~~**v2.0**~~ | ~~Foundations and Integration Testing~~ | ✅ **COMPLETE** — CI/CD, integration tests, `--report-file`, JSON output, ValidationDiff |
 | **v2.1** | Low-Risk Optimizer Extensions | Collinear merge, same-axis merge, redundant feedrate, M73 progress, min layer time advisory, temp tower detection |
 | **v2.2** | Arc Fitting (G2/G3) | Highest-impact optimization: detect linear sequences on circular arcs and replace with arc commands |
 | **v2.3** | Dialect Expansion | PrusaSlicer and Cura comment parsing, TOML machine profiles, `--machine` flag |
@@ -20,107 +20,46 @@
 
 ---
 
-## v2.0 -- Foundations and Integration Testing
+## ✅ v2.0 -- Foundations and Integration Testing — COMPLETE
 
-### Goal
+**Completed:** 2026-03-26 | **Tests:** 76 (63 unit + 11 integration + 2 doc) | **Warnings:** 0
 
-Establish a trustworthy CI pipeline with integration tests against real OrcaSlicer G-Code, add machine-readable report output (`--report-file`, JSON), and lock down the post-optimization re-analysis safety net before any new optimizer rules land.
+### What Was Built
 
-### Features
+| Feature | Files | Status |
+|---------|-------|--------|
+| Integration test harness | `tests/integration.rs` | ✅ |
+| Round-trip fidelity tests | `tests/integration.rs` | ✅ |
+| Analyzer accuracy tests | `tests/integration.rs` | ✅ |
+| Optimizer idempotence tests | `tests/integration.rs` | ✅ |
+| Post-optimization re-analysis (`ValidationDiff`) | `src/diagnostics.rs`, `src/main.rs` | ✅ |
+| `--report-file` CLI flag | `src/cli.rs`, `src/main.rs` | ✅ |
+| `--report-format <text\|json>` CLI flag | `src/cli.rs`, `src/main.rs` | ✅ |
+| `serde::Serialize` on all report types | `src/diagnostics.rs`, `src/models.rs` | ✅ |
+| CI/CD GitHub Actions | `.github/workflows/ci.yml` | ✅ |
 
-**Integration test harness** (new `tests/` directory)
+### Implementation Notes
 
-- Create `tests/integration.rs` with `#[test]` functions that load `Orca GCODE/malm_slide.gcode` and `Orca GCODE/rose.gcode` via `include_str!` or runtime `std::fs::read_to_string` with a path relative to `CARGO_MANIFEST_DIR`.
-- Tests use the library API directly (`parse_all`, `analyze`, `optimize`, `emit`) -- no subprocess spawning needed at this stage.
-- **Complexity: Low.** This is test code, not production logic.
+- **Layer counting fix:** The analyzer was double-counting layers for OrcaSlicer files (both `;LAYER_CHANGE` comments and Z-move detection firing simultaneously). Fixed with a `has_layer_change_comments` flag — when OrcaSlicer comment signals are present, Z-based detection is suppressed entirely. Correct counts: 255 (malm_slide), 600 (rose).
+- **Actual bbox values:** `bbox_max.z` is `~51.45` for malm_slide and `~120.45` for rose (spec estimates were 51.05/120.05; the actual G-Code files have slightly higher max Z).
+- **ReportFormat:** Uses `#[derive(Default)]` with `#[default]` on the `Text` variant (clippy pedantic prefers this over manual `impl Default`).
+- **JSON stdout mode:** `--report-format json` without `--report-file` writes JSON to stdout and suppresses G-Code output; cannot be combined with `--output`.
 
-**Round-trip fidelity tests**
-
-- For each real file: parse, emit to a `Vec<u8>`, re-parse the emitted output, and assert that every `GCodeCommand` variant and every numeric field matches within `f64::EPSILON` tolerance. Files affected: new `tests/integration.rs`.
-- This catches parser/emitter drift and ensures lossless round-tripping for all OrcaSlicer constructs (thumbnail blocks, Klipper macros, packed params).
-- **Complexity: Low.**
-
-**Analyzer accuracy tests**
-
-- Parse `malm_slide.gcode`, run `analyze`, and assert: `stats.layer_count == 255`, `stats.bbox_max.z` is approximately `51.05`, no `Severity::Error` diagnostics when limits are set to at least 300x300x400.
-- Parse `rose.gcode`, run `analyze`, and assert: `stats.layer_count == 600`, `stats.bbox_max.z` is approximately `120.05`.
-- Assert `total_filament_mm > 0.0` and `estimated_time_seconds > 0.0` for both files.
-- **Complexity: Low.**
-
-**Optimizer idempotence tests**
-
-- For each real file: run `optimize` twice in succession. Assert the second pass produces zero `OptimizationChange` entries (all redundancies were removed on the first pass).
-- **Complexity: Low.**
-
-**Post-optimization re-analysis validation** (`src/main.rs`, `src/analyzer.rs`)
-
-- After the optimizer runs, re-analyze the optimized command list. Compare the new `AnalysisResult` against the pre-optimization result. If any new `Severity::Error` diagnostic appears that was not present before, abort and report the regression.
-- Add a new struct `ValidationDiff` to `src/diagnostics.rs` that holds the pre/post diagnostic delta.
-- Wire the re-analysis into `main.rs` after the `optimize` call and before `write_output`.
-- **Complexity: Medium.** The analyzer is already pure; the work is in the comparison and abort logic.
-
-**`--report-file <path>` CLI flag** (`src/cli.rs`, `src/main.rs`, `src/diagnostics.rs`)
-
-- New optional `--report-file` argument. When provided, write the `AnalysisReport` to the given path in addition to the stderr summary.
-- Start with a plain-text format identical to the stderr output. JSON comes next.
-- **Complexity: Low.**
-
-**JSON report output** (`src/diagnostics.rs`, `src/main.rs`, `Cargo.toml`)
-
-- Add `serde` (MIT OR Apache-2.0) and `serde_json` (MIT OR Apache-2.0) as dependencies.
-- Derive `Serialize` on `AnalysisReport`, `PrintStats`, `Diagnostic`, `OptimizationChange`, `Severity`, and `Point3D`.
-- Add `--report-format <text|json>` CLI flag (default `text`). When `json` is selected and `--report-file` is given, serialize to JSON. When `json` is selected without `--report-file`, write JSON to stdout instead of the G-Code output (mutually exclusive with non-`--check-only` mode).
-- **Complexity: Low-Medium.** Serde derive is mechanical; the complexity is in the CLI argument validation (ensure `--report-format json` without `--report-file` implies `--check-only`).
-
-**CI/CD with GitHub Actions** (new `.github/workflows/ci.yml`)
-
-- Matrix: `stable` and `nightly` Rust on `ubuntu-latest` and `windows-latest`.
-- Steps: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, `cargo test --release`.
-- Cache `~/.cargo/registry` and `target/` directories.
-- The workflow file references the test fixtures in `Orca GCODE/` which are committed to the repo.
-- **Complexity: Low.**
-
-### Integration Test Cases
+### Integration Test Cases — All Passing
 
 | Test | File | Assertion |
 |------|------|-----------|
-| `round_trip_malm_slide` | `malm_slide.gcode` | Parse -> emit -> re-parse produces identical AST |
-| `round_trip_rose` | `rose.gcode` | Parse -> emit -> re-parse produces identical AST |
-| `analyze_malm_slide_layers` | `malm_slide.gcode` | `layer_count == 255`, `bbox_max.z ~ 51.05` |
-| `analyze_rose_layers` | `rose.gcode` | `layer_count == 600`, `bbox_max.z ~ 120.05` |
-| `analyze_no_errors_in_bounds` | both | Zero `Severity::Error` with 300x300x400 limits |
+| `round_trip_malm_slide` | `malm_slide.gcode` | emit → re-parse → re-emit produces identical bytes |
+| `round_trip_rose` | `rose.gcode` | emit → re-parse → re-emit produces identical bytes |
+| `analyze_malm_slide_layers` | `malm_slide.gcode` | `layer_count == 255`, `bbox_max.z ~51.45` |
+| `analyze_rose_layers` | `rose.gcode` | `layer_count == 600`, `bbox_max.z ~120.45` |
+| `analyze_no_errors_in_bounds` | both | Zero `Severity::Error` with 300×300×400 limits |
 | `optimize_idempotent_malm` | `malm_slide.gcode` | Second optimize pass produces 0 changes |
 | `optimize_idempotent_rose` | `rose.gcode` | Second optimize pass produces 0 changes |
 | `optimize_preserves_extrusion` | both | `total_filament_mm` unchanged after optimize (within 1e-6) |
 | `optimize_preserves_bbox` | both | `bbox_min` and `bbox_max` unchanged after optimize |
-| `json_report_valid` | `malm_slide.gcode` | JSON output parses as valid JSON, contains `layer_count` field |
+| `json_report_valid` | `malm_slide.gcode` | JSON valid, `stats.layer_count == 255` |
 | `post_opt_reanalysis_no_regression` | both | No new `Error` diagnostics after optimization |
-
-### AST / API Changes
-
-- Add `#[derive(serde::Serialize)]` to `PrintStats`, `Diagnostic`, `OptimizationChange`, `Severity`, `AnalysisReport`, `Point3D` in `src/diagnostics.rs` and `src/models.rs`. These derives are additive and do not break existing API.
-- Add `ValidationDiff` struct to `src/diagnostics.rs`:
-  ```rust
-  pub struct ValidationDiff {
-      pub new_errors: Vec<Diagnostic>,
-      pub resolved_errors: Vec<Diagnostic>,
-      pub regression_detected: bool,
-  }
-  ```
-- Add `--report-file`, `--report-format` to `Cli` in `src/cli.rs`.
-
-### Safety Checklist
-
-- [ ] All 58 existing unit tests still pass.
-- [ ] `cargo clippy -- -D warnings` produces zero diagnostics.
-- [ ] Round-trip tests confirm no data loss for both real G-Code files.
-- [ ] `--check-only` mode still exits non-zero on error diagnostics.
-- [ ] JSON output is valid JSON (tested by deserializing in the integration test).
-- [ ] Post-optimization re-analysis does not false-positive on the two test files (the v1 optimizer rules should not introduce regressions).
-
-### Dependencies
-
-- None. This is the foundation version; all later versions depend on v2.0.
 
 ---
 
