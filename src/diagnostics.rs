@@ -12,7 +12,7 @@ use std::fmt;
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// The severity level of a diagnostic finding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub enum Severity {
     /// Informational note; does not indicate a problem.
     Info,
@@ -41,7 +41,7 @@ impl fmt::Display for Severity {
 /// Each diagnostic carries a stable [`code`][`Diagnostic::code`] (e.g.
 /// `"E001"`) suitable for machine-readable output or CI filtering, plus a
 /// human-readable [`message`][`Diagnostic::message`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Diagnostic {
     /// Severity of this finding.
     pub severity: Severity,
@@ -74,7 +74,7 @@ impl fmt::Display for Diagnostic {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Statistics collected during a simulation/analysis pass.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct PrintStats {
     /// Number of layer changes detected.
     pub layer_count: u32,
@@ -122,7 +122,7 @@ impl Default for PrintStats {
 
 /// Records a single change made (or that would be made in dry-run) by the
 /// optimizer.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct OptimizationChange {
     /// 1-based line number of the affected command.
     pub line: u32,
@@ -137,7 +137,7 @@ pub struct OptimizationChange {
 
 /// The complete result of a pipeline run: diagnostics, statistics, and
 /// optimizer changes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AnalysisReport {
     /// All findings from the analyser and optimizer.
     pub diagnostics: Vec<Diagnostic>,
@@ -215,5 +215,29 @@ impl AnalysisReport {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn severity_serializes_to_string() {
+        let s = serde_json::to_string(&Severity::Error).unwrap();
+        assert_eq!(s, r#""Error""#);
+    }
+
+    #[test]
+    fn analysis_report_serializes_to_json() {
+        let report = AnalysisReport {
+            diagnostics: vec![],
+            stats: PrintStats::default(),
+            changes: vec![],
+            dry_run: false,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(val["stats"]["layer_count"].is_number());
     }
 }

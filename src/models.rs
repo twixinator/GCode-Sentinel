@@ -177,7 +177,7 @@ impl<T> Deref for Spanned<T> {
 ///
 /// Used to track the current print-head position and to represent bounding-box
 /// corners in analysis results.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Point3D {
     /// X axis position in millimetres.
     pub x: f64,
