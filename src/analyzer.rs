@@ -50,6 +50,10 @@ struct PrinterState {
     e_absolute: bool,
     /// Last Z seen during a linear move; used for Z-based layer detection.
     last_z: f64,
+    /// Set when a `;LAYER_CHANGE` comment fires; cleared after the next Z move.
+    /// Prevents double-counting layers in `OrcaSlicer` files that emit both a
+    /// comment and a Z increase for the same layer.
+    layer_change_pending: bool,
 }
 
 impl Default for PrinterState {
@@ -61,6 +65,7 @@ impl Default for PrinterState {
             is_absolute: true,
             e_absolute: true,
             last_z: 0.0,
+            layer_change_pending: false,
         }
     }
 }
@@ -199,7 +204,7 @@ fn process_command<'a>(
             handle_set_position(*x, *y, *z, *e, outputs.printer);
         }
         GCodeCommand::Comment { text } => {
-            handle_comment(text, outputs.print_stats);
+            handle_comment(text, outputs.printer, outputs.print_stats);
         }
         // GCommand, MetaCommand, Unknown: no motion semantics — skip.
         GCodeCommand::GCommand { .. }
@@ -275,7 +280,12 @@ fn handle_linear_move(
     // `OrcaSlicer`'s `;LAYER_CHANGE` comment is the preferred signal; this is the
     // fallback for slicers that do not emit it.
     if params.target_z.is_some() && dest.z > outputs.printer.last_z {
-        outputs.print_stats.layer_count += 1;
+        // If a `;LAYER_CHANGE` comment already fired for this layer, skip
+        // the Z-based increment to avoid double-counting.
+        if !outputs.printer.layer_change_pending {
+            outputs.print_stats.layer_count += 1;
+        }
+        outputs.printer.layer_change_pending = false;
         outputs.diags.push(Diagnostic {
             severity: Severity::Info,
             line,
@@ -337,9 +347,14 @@ fn handle_set_position(
 /// directly without re-emitting an `I001` diagnostic (the comment itself is the
 /// ground truth; the Z-based diagnostic remains for slicers that do not emit
 /// the comment).
-fn handle_comment<S: AsRef<str>>(text: S, print_stats: &mut PrintStats) {
+fn handle_comment<S: AsRef<str>>(
+    text: S,
+    printer: &mut PrinterState,
+    print_stats: &mut PrintStats,
+) {
     if text.as_ref() == "LAYER_CHANGE" {
         print_stats.layer_count += 1;
+        printer.layer_change_pending = true;
     }
 }
 
