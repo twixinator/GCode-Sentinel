@@ -7,6 +7,23 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use clap::ValueEnum;
+
+/// Output format for the analysis report written via `--report-file` or to
+/// stdout when used without `--report-file`.
+#[derive(Debug, Clone, PartialEq, ValueEnum)]
+pub enum ReportFormat {
+    /// Human-readable text, identical to the stderr summary (default).
+    Text,
+    /// Machine-readable JSON.
+    Json,
+}
+
+impl Default for ReportFormat {
+    fn default() -> Self {
+        Self::Text
+    }
+}
 
 /// High-performance G-Code validator and optimizer for 3D printing.
 #[derive(Debug, Parser)]
@@ -67,6 +84,21 @@ pub struct Cli {
     /// recommended for large files.
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Write the analysis report to this file path in addition to the stderr
+    /// summary.
+    ///
+    /// Format is controlled by `--report-format` (default: plain text).
+    #[arg(long)]
+    pub report_file: Option<PathBuf>,
+
+    /// Format for the report produced by `--report-file`, or written to stdout
+    /// when `--report-format json` is given without `--report-file`.
+    ///
+    /// When `json` is selected without `--report-file`, JSON is written to
+    /// stdout and G-Code output is suppressed (implies check-only behaviour).
+    #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
+    pub report_format: ReportFormat,
 }
 
 impl Cli {
@@ -90,5 +122,44 @@ impl Cli {
             max_y: self.max_y.unwrap_or(defaults.max_y),
             max_z: self.max_z.unwrap_or(defaults.max_z),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn report_file_flag_is_parsed() {
+        let cli = Cli::try_parse_from([
+            "gcode-sentinel",
+            "input.gcode",
+            "--report-file",
+            "/tmp/report.txt",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.report_file.unwrap().to_str().unwrap(),
+            "/tmp/report.txt"
+        );
+    }
+
+    #[test]
+    fn report_format_json_is_parsed() {
+        let cli = Cli::try_parse_from([
+            "gcode-sentinel",
+            "input.gcode",
+            "--report-format",
+            "json",
+        ])
+        .unwrap();
+        assert!(matches!(cli.report_format, ReportFormat::Json));
+    }
+
+    #[test]
+    fn report_format_defaults_to_text() {
+        let cli = Cli::try_parse_from(["gcode-sentinel", "input.gcode"]).unwrap();
+        assert!(matches!(cli.report_format, ReportFormat::Text));
     }
 }
