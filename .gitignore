@@ -1,1 +1,5 @@
 /target
+
+# Documentation managed outside git
+docs/superpowers/
+*.md

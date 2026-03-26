@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 description = "High-performance CLI tool for 3D print G-Code validation and optimization"
-license = "MIT"
-repository = "https://github.com/example/gcode-sentinel"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/twixinator/GCode-Sentinel"
 keywords = ["gcode", "3dprinting", "cli", "validation", "optimization"]
 categories = ["command-line-utilities", "parser-implementations"]
 
