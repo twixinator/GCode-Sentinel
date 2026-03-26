@@ -11,18 +11,13 @@ use clap::ValueEnum;
 
 /// Output format for the analysis report written via `--report-file` or to
 /// stdout when used without `--report-file`.
-#[derive(Debug, Clone, PartialEq, ValueEnum)]
+#[derive(Debug, Clone, Default, PartialEq, ValueEnum)]
 pub enum ReportFormat {
     /// Human-readable text, identical to the stderr summary (default).
+    #[default]
     Text,
     /// Machine-readable JSON.
     Json,
-}
-
-impl Default for ReportFormat {
-    fn default() -> Self {
-        Self::Text
-    }
 }
 
 /// High-performance G-Code validator and optimizer for 3D printing.

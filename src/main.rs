@@ -1,7 +1,7 @@
 #![warn(clippy::pedantic)]
 
 use std::fs;
-use std::io::Write as _;
+use std::io::Write as IoWrite;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -9,8 +9,8 @@ use memmap2::Mmap;
 use tracing::{info, warn};
 
 use gcode_sentinel::analyzer::analyze;
-use gcode_sentinel::cli::Cli;
-use gcode_sentinel::diagnostics::{AnalysisReport, OptimizationChange, Severity};
+use gcode_sentinel::cli::{Cli, ReportFormat};
+use gcode_sentinel::diagnostics::{AnalysisReport, OptimizationChange, Severity, ValidationDiff};
 use gcode_sentinel::emitter::{emit, EmitConfig};
 use gcode_sentinel::optimizer::{optimize, OptConfig};
 use gcode_sentinel::parser::parse_all;
@@ -22,6 +22,7 @@ fn main() -> Result<()> {
     info!(input = %cli.input.display(), "starting GCode-Sentinel");
 
     validate_input(&cli)?;
+    validate_cli_flags(&cli)?;
 
     let limits = cli.machine_limits();
     log_limits(limits.as_ref());
@@ -30,15 +31,45 @@ fn main() -> Result<()> {
     let commands = parse_all(&text).context("parse error in input file")?;
     info!(commands = commands.len(), "parse complete");
 
-    let analysis = analyze(commands.iter(), limits.as_ref());
-    log_analysis(&analysis.diagnostics);
+    let pre_analysis = analyze(commands.iter(), limits.as_ref());
+    log_analysis(&pre_analysis.diagnostics);
 
-    let opt_config = OptConfig { dry_run: cli.check_only };
+    // JSON-to-stdout without --report-file implies check-only (no G-Code written).
+    let effective_dry_run =
+        cli.check_only || (cli.report_format == ReportFormat::Json && cli.report_file.is_none());
+    let opt_config = OptConfig { dry_run: effective_dry_run };
     let opt_result = optimize(commands, &opt_config);
-    log_optimization(opt_result.changes.len(), cli.check_only);
+    log_optimization(opt_result.changes.len(), effective_dry_run);
 
-    let report = build_report(analysis, opt_result.changes, cli.check_only);
+    // Re-analyze the (possibly reduced) command list to detect regressions.
+    let post_analysis = analyze(opt_result.commands.iter(), limits.as_ref());
+    let diff = ValidationDiff::compute(&pre_analysis.diagnostics, &post_analysis.diagnostics);
+    if diff.regression_detected {
+        for e in &diff.new_errors {
+            warn!(
+                code = e.code,
+                line = e.line,
+                message = %e.message,
+                "optimizer introduced new error"
+            );
+        }
+        anyhow::bail!(
+            "optimizer regression: {} new error(s) appeared after optimization",
+            diff.new_errors.len()
+        );
+    }
+
+    let report = build_report(post_analysis, opt_result.changes, effective_dry_run);
     print_report(&report)?;
+    write_report_file(&cli, &report)?;
+
+    // JSON-to-stdout mode: write JSON, skip G-Code output.
+    if cli.report_format == ReportFormat::Json && cli.report_file.is_none() {
+        let json =
+            serde_json::to_string_pretty(&report).context("failed to serialize report to JSON")?;
+        println!("{json}");
+        return Ok(());
+    }
 
     if report.has_errors() && cli.check_only {
         anyhow::bail!(
@@ -47,7 +78,7 @@ fn main() -> Result<()> {
         );
     }
 
-    if !cli.check_only {
+    if !effective_dry_run {
         write_output(&cli, &opt_result.commands)?;
     }
 
@@ -76,6 +107,19 @@ fn validate_input(cli: &Cli) -> Result<()> {
     }
     if !cli.input.is_file() {
         anyhow::bail!("input path is not a regular file: {}", cli.input.display());
+    }
+    Ok(())
+}
+
+fn validate_cli_flags(cli: &Cli) -> Result<()> {
+    if cli.report_format == ReportFormat::Json
+        && cli.report_file.is_none()
+        && cli.output.is_some()
+    {
+        anyhow::bail!(
+            "--report-format json without --report-file cannot be combined with --output \
+             (JSON would go to stdout, conflicting with the G-Code output destination)"
+        );
     }
     Ok(())
 }
@@ -146,6 +190,30 @@ fn print_report(report: &AnalysisReport) -> Result<()> {
             "errors found in input file"
         );
     }
+    Ok(())
+}
+
+fn write_report_file(cli: &Cli, report: &AnalysisReport) -> Result<()> {
+    let Some(ref path) = cli.report_file else {
+        return Ok(());
+    };
+    let mut file = fs::File::create(path)
+        .with_context(|| format!("failed to create report file: {}", path.display()))?;
+    match cli.report_format {
+        ReportFormat::Text => {
+            let mut summary = String::new();
+            report
+                .write_summary(&mut summary)
+                .context("failed to format text report")?;
+            file.write_all(summary.as_bytes())
+                .context("failed to write text report file")?;
+        }
+        ReportFormat::Json => {
+            serde_json::to_writer_pretty(&mut file, report)
+                .context("failed to write JSON report file")?;
+        }
+    }
+    info!(path = %path.display(), format = ?cli.report_format, "report file written");
     Ok(())
 }
 
