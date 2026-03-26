@@ -218,6 +218,71 @@ impl AnalysisReport {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// ValidationDiff
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Delta between pre- and post-optimization diagnostic sets.
+///
+/// Used to detect regressions introduced by the optimizer: if any new
+/// [`Severity::Error`] diagnostic appears after optimization that was not
+/// present before, [`regression_detected`][`ValidationDiff::regression_detected`]
+/// is set to `true`.
+#[derive(Debug, Clone)]
+pub struct ValidationDiff {
+    /// Error diagnostics present in post but absent from pre (matched by
+    /// `code` + `line`).
+    pub new_errors: Vec<Diagnostic>,
+
+    /// Error diagnostics present in pre but absent from post.
+    pub resolved_errors: Vec<Diagnostic>,
+
+    /// `true` when [`new_errors`][`ValidationDiff::new_errors`] is non-empty.
+    pub regression_detected: bool,
+}
+
+impl ValidationDiff {
+    /// Compute the diff between `pre` and `post` diagnostic slices.
+    ///
+    /// Only [`Severity::Error`] diagnostics are considered for regression
+    /// detection; warnings and info diagnostics are ignored.
+    #[must_use]
+    pub fn compute(pre: &[Diagnostic], post: &[Diagnostic]) -> Self {
+        let pre_errors: Vec<&Diagnostic> =
+            pre.iter().filter(|d| d.severity == Severity::Error).collect();
+        let post_errors: Vec<&Diagnostic> =
+            post.iter().filter(|d| d.severity == Severity::Error).collect();
+
+        let new_errors: Vec<Diagnostic> = post_errors
+            .iter()
+            .filter(|p| {
+                !pre_errors
+                    .iter()
+                    .any(|e| e.code == p.code && e.line == p.line)
+            })
+            .map(|d| (*d).clone())
+            .collect();
+
+        let resolved_errors: Vec<Diagnostic> = pre_errors
+            .iter()
+            .filter(|p| {
+                !post_errors
+                    .iter()
+                    .any(|e| e.code == p.code && e.line == p.line)
+            })
+            .map(|d| (*d).clone())
+            .collect();
+
+        let regression_detected = !new_errors.is_empty();
+
+        Self {
+            new_errors,
+            resolved_errors,
+            regression_detected,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +304,47 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         let val: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(val["stats"]["layer_count"].is_number());
+    }
+
+    #[test]
+    fn validation_diff_detects_new_errors() {
+        let pre = vec![Diagnostic {
+            severity: Severity::Warning,
+            line: 10,
+            code: "W001",
+            message: "existing warning".to_string(),
+        }];
+        let post = vec![
+            Diagnostic {
+                severity: Severity::Warning,
+                line: 10,
+                code: "W001",
+                message: "existing warning".to_string(),
+            },
+            Diagnostic {
+                severity: Severity::Error,
+                line: 20,
+                code: "E001",
+                message: "new error".to_string(),
+            },
+        ];
+        let diff = ValidationDiff::compute(&pre, &post);
+        assert!(diff.regression_detected);
+        assert_eq!(diff.new_errors.len(), 1);
+        assert_eq!(diff.new_errors[0].code, "E001");
+        assert!(diff.resolved_errors.is_empty());
+    }
+
+    #[test]
+    fn validation_diff_no_regression_when_errors_unchanged() {
+        let diags = vec![Diagnostic {
+            severity: Severity::Error,
+            line: 5,
+            code: "E002",
+            message: "pre-existing error".to_string(),
+        }];
+        let diff = ValidationDiff::compute(&diags, &diags);
+        assert!(!diff.regression_detected);
+        assert!(diff.new_errors.is_empty());
     }
 }
