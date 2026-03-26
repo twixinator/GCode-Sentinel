@@ -73,7 +73,7 @@ fn analyze_malm_slide_layers() {
     let cmds = parse_all(&text).expect("must parse");
     let result = analyze(cmds.iter(), None);
 
-    assert_eq!(result.stats.layer_count, 1638, "malm_slide must have 1638 layers");
+    assert_eq!(result.stats.layer_count, 255, "malm_slide must have 255 layers");
     assert!(
         (result.stats.bbox_max.z - 51.45).abs() < 0.1,
         "malm_slide bbox_max.z must be ~51.45, got {}",
@@ -89,7 +89,7 @@ fn analyze_rose_layers() {
     let cmds = parse_all(&text).expect("must parse");
     let result = analyze(cmds.iter(), None);
 
-    assert_eq!(result.stats.layer_count, 4053, "rose must have 4053 layers");
+    assert_eq!(result.stats.layer_count, 600, "rose must have 600 layers");
     assert!(
         (result.stats.bbox_max.z - 120.45).abs() < 0.1,
         "rose bbox_max.z must be ~120.45, got {}",
@@ -225,8 +225,8 @@ fn json_report_valid() {
     );
     assert_eq!(
         json_val["stats"]["layer_count"].as_u64().unwrap(),
-        1638,
-        "layer_count in JSON must be 1638 for malm_slide"
+        255,
+        "layer_count in JSON must be 255 for malm_slide"
     );
 }
 

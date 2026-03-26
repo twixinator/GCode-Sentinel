@@ -50,10 +50,12 @@ struct PrinterState {
     e_absolute: bool,
     /// Last Z seen during a linear move; used for Z-based layer detection.
     last_z: f64,
-    /// Set when a `;LAYER_CHANGE` comment fires; cleared after the next Z move.
-    /// Prevents double-counting layers in `OrcaSlicer` files that emit both a
-    /// comment and a Z increase for the same layer.
-    layer_change_pending: bool,
+    /// Set to `true` once any `;LAYER_CHANGE` comment is seen.
+    has_layer_change_comments: bool,
+    /// Layer count from Z-based detection (fallback for non-OrcaSlicer files).
+    /// Only merged into `PrintStats::layer_count` at the end if no
+    /// `;LAYER_CHANGE` comments were encountered.
+    z_layer_count: u32,
 }
 
 impl Default for PrinterState {
@@ -65,7 +67,8 @@ impl Default for PrinterState {
             is_absolute: true,
             e_absolute: true,
             last_z: 0.0,
-            layer_change_pending: false,
+            has_layer_change_comments: false,
+            z_layer_count: 0,
         }
     }
 }
@@ -148,6 +151,12 @@ pub fn analyze<'a>(
             print_stats: &mut print_stats,
         };
         process_command(spanned, &mut outputs, limits);
+    }
+
+    // If the file contained no `;LAYER_CHANGE` comments, fall back to
+    // Z-based layer detection.  Otherwise the comment count is authoritative.
+    if !printer.has_layer_change_comments {
+        print_stats.layer_count = printer.z_layer_count;
     }
 
     AnalysisResult {
@@ -277,15 +286,10 @@ fn handle_linear_move(
     }
 
     // Z-based layer change detection: Z increases while a LinearMove specifies Z.
-    // `OrcaSlicer`'s `;LAYER_CHANGE` comment is the preferred signal; this is the
-    // fallback for slicers that do not emit it.
+    // When the file contains `;LAYER_CHANGE` comments (OrcaSlicer), those are the
+    // sole source of truth — Z-hops during retraction must not inflate the count.
     if params.target_z.is_some() && dest.z > outputs.printer.last_z {
-        // If a `;LAYER_CHANGE` comment already fired for this layer, skip
-        // the Z-based increment to avoid double-counting.
-        if !outputs.printer.layer_change_pending {
-            outputs.print_stats.layer_count += 1;
-        }
-        outputs.printer.layer_change_pending = false;
+        outputs.printer.z_layer_count += 1;
         outputs.diags.push(Diagnostic {
             severity: Severity::Info,
             line,
@@ -353,8 +357,8 @@ fn handle_comment<S: AsRef<str>>(
     print_stats: &mut PrintStats,
 ) {
     if text.as_ref() == "LAYER_CHANGE" {
+        printer.has_layer_change_comments = true;
         print_stats.layer_count += 1;
-        printer.layer_change_pending = true;
     }
 }
 
