@@ -21,6 +21,9 @@ pub enum ReportFormat {
 }
 
 /// High-performance G-Code validator and optimizer for 3D printing.
+// Boolean fields here are clap flags; each bool maps to exactly one CLI switch.
+// Refactoring into enums would only add indirection without semantic benefit.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Parser)]
 #[command(author, version, about = "High-performance G-Code validator and optimizer for 3D printing")]
 pub struct Cli {
@@ -94,6 +97,24 @@ pub struct Cli {
     /// stdout and G-Code output is suppressed (implies check-only behaviour).
     #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
     pub report_format: ReportFormat,
+
+    /// Merge collinear consecutive linear moves into single moves.
+    ///
+    /// Detects three or more consecutive G1 commands on the same 3D line
+    /// with consistent feedrate and proportional extrusion, replacing them
+    /// with a single move.  Opt-in because it modifies move structure.
+    #[arg(long)]
+    pub merge_collinear: bool,
+
+    /// Strip existing M73 progress markers and re-insert recalculated ones
+    /// at each layer boundary.
+    #[arg(long)]
+    pub insert_progress: bool,
+
+    /// Warn when any layer's estimated print time falls below this threshold
+    /// (in seconds).  Disabled when absent.
+    #[arg(long)]
+    pub min_layer_time: Option<f64>,
 }
 
 impl Cli {

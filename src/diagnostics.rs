@@ -100,6 +100,11 @@ pub struct PrintStats {
 
     /// Maximum corner of the axis-aligned bounding box of all moves.
     pub bbox_max: crate::models::Point3D,
+
+    /// Estimated print time for each layer, in seconds.
+    ///
+    /// Populated during analysis; one entry per detected layer change.
+    pub per_layer_times: Vec<f64>,
 }
 
 impl Default for PrintStats {
@@ -112,6 +117,7 @@ impl Default for PrintStats {
             move_count: 0,
             bbox_min: crate::models::Point3D { x: f64::MAX, y: f64::MAX, z: f64::MAX },
             bbox_max: crate::models::Point3D { x: f64::MIN, y: f64::MIN, z: f64::MIN },
+            per_layer_times: Vec::new(),
         }
     }
 }

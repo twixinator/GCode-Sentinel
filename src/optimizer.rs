@@ -37,6 +37,17 @@ pub struct OptConfig {
     /// unchanged.  Callers can inspect [`OptimizationResult::changes`] to
     /// preview what would be modified.
     pub dry_run: bool,
+
+    /// When `true`, merge collinear consecutive G1 moves into single moves.
+    ///
+    /// Detects three or more consecutive G1 commands on the same 3D line
+    /// with consistent feedrate and proportional extrusion, replacing them
+    /// with a single move.  Opt-in because it modifies move structure.
+    pub merge_collinear: bool,
+
+    /// When `true`, strip existing M73 progress markers and re-insert
+    /// recalculated ones at each layer boundary.
+    pub insert_progress: bool,
 }
 
 /// The result of a single optimization pass.
@@ -673,7 +684,7 @@ mod tests {
             spanned(g1_empty(), 1),
             spanned(g1_at(5.0, 5.0), 2),
         ];
-        let config = OptConfig { dry_run: true };
+        let config = OptConfig { dry_run: true, ..Default::default() };
         let result = optimize(cmds, &config);
 
         // Command list is unchanged.

@@ -128,7 +128,7 @@ fn optimize_idempotent_malm() {
     let text = fs::read_to_string(fixture("malm_slide.gcode")).expect("fixture must exist");
     let cmds = parse_all(&text).expect("must parse");
 
-    let config = OptConfig { dry_run: false };
+    let config = OptConfig { dry_run: false, ..Default::default() };
     let pass1 = optimize(cmds, &config);
     let pass2 = optimize(pass1.commands, &config);
 
@@ -144,7 +144,7 @@ fn optimize_idempotent_rose() {
     let text = fs::read_to_string(fixture("rose.gcode")).expect("fixture must exist");
     let cmds = parse_all(&text).expect("must parse");
 
-    let config = OptConfig { dry_run: false };
+    let config = OptConfig { dry_run: false, ..Default::default() };
     let pass1 = optimize(cmds, &config);
     let pass2 = optimize(pass1.commands, &config);
 
@@ -165,7 +165,7 @@ fn optimize_preserves_extrusion() {
         let cmds = parse_all(&text).unwrap_or_else(|_| panic!("{name} must parse"));
 
         let pre = analyze(cmds.iter(), None);
-        let opt = optimize(cmds, &OptConfig { dry_run: false });
+        let opt = optimize(cmds, &OptConfig { dry_run: false, ..Default::default() });
         let post = analyze(opt.commands.iter(), None);
 
         assert!(
@@ -185,7 +185,7 @@ fn optimize_preserves_bbox() {
         let cmds = parse_all(&text).unwrap_or_else(|_| panic!("{name} must parse"));
 
         let pre = analyze(cmds.iter(), None);
-        let opt = optimize(cmds, &OptConfig { dry_run: false });
+        let opt = optimize(cmds, &OptConfig { dry_run: false, ..Default::default() });
         let post = analyze(opt.commands.iter(), None);
 
         assert_eq!(
@@ -240,7 +240,7 @@ fn post_opt_reanalysis_no_regression() {
         let cmds = parse_all(&text).unwrap_or_else(|_| panic!("{name} must parse"));
 
         let pre = analyze(cmds.iter(), None);
-        let opt = optimize(cmds, &OptConfig { dry_run: false });
+        let opt = optimize(cmds, &OptConfig { dry_run: false, ..Default::default() });
         let post = analyze(opt.commands.iter(), None);
 
         let diff = ValidationDiff::compute(&pre.diagnostics, &post.diagnostics);

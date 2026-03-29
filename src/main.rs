@@ -37,7 +37,7 @@ fn main() -> Result<()> {
     // JSON-to-stdout without --report-file implies check-only (no G-Code written).
     let effective_dry_run =
         cli.check_only || (cli.report_format == ReportFormat::Json && cli.report_file.is_none());
-    let opt_config = OptConfig { dry_run: effective_dry_run };
+    let opt_config = OptConfig { dry_run: effective_dry_run, ..Default::default() };
     let opt_result = optimize(commands, &opt_config);
     log_optimization(opt_result.changes.len(), effective_dry_run);
 
