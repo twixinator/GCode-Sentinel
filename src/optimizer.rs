@@ -86,6 +86,11 @@ pub fn optimize<'a>(
     // Bit-vector: true = this command is redundant and should be removed.
     let mut redundant: Vec<bool> = vec![false; commands.len()];
 
+    // Modification table: `Some(cmd)` = replace this slot's inner command.
+    // Indexed in parallel with `commands`.  Rule 8 writes here instead of
+    // marking a command redundant — the move survives but loses its `f` field.
+    let mut modifications: Vec<Option<GCodeCommand<'a>>> = vec![None; commands.len()];
+
     // ── Pass: walk commands once, maintaining state ───────────────────────────
     let mut state = PassState::new();
 
@@ -104,12 +109,57 @@ pub fn optimize<'a>(
             });
         }
 
+        // ── Rule 8: redundant feedrate elimination ───────────────────────────
+        // Strip the `f` field from moves whose feedrate matches the current
+        // modal feedrate.  The command is not removed — it is transformed.
+        // Only applies to non-redundant commands (no point modifying a move
+        // that will be discarded anyway).
+        //
+        // Rule 8 runs BEFORE Rule 7 so that the effective (post-strip) feedrate
+        // is used when Rule 7 checks for consecutive same-axis travel.  This
+        // prevents a move that changes axis position (but not feedrate) from
+        // being incorrectly collapsed by Rule 7 just because it originally
+        // carried a now-redundant F parameter.
+        if !redundant[idx] {
+            let cmd_feed = match cmd {
+                GCodeCommand::RapidMove { f, .. } | GCodeCommand::LinearMove { f, .. } => *f,
+                _ => None,
+            };
+            if let Some(f_val) = cmd_feed {
+                if let Some(modal) = state.modal_feedrate {
+                    if (f_val - modal).abs() < FEEDRATE_TOLERANCE {
+                        let stripped = match cmd {
+                            GCodeCommand::RapidMove { x, y, z, .. } => {
+                                GCodeCommand::RapidMove { x: *x, y: *y, z: *z, f: None }
+                            }
+                            GCodeCommand::LinearMove { x, y, z, e, .. } => {
+                                GCodeCommand::LinearMove { x: *x, y: *y, z: *z, e: *e, f: None }
+                            }
+                            _ => unreachable!(),
+                        };
+                        modifications[idx] = Some(stripped);
+                        changes.push(OptimizationChange {
+                            line: spanned.line,
+                            description: format!("redundant feedrate F{f_val:.0} (already modal)"),
+                        });
+                    }
+                }
+            }
+        }
+
         // ── Rule 7: consecutive same-axis travel ─────────────────────────────
         // When a new single-axis non-extruding move supersedes a prior one on
         // the same axis with the same feedrate, the prior move is redundant —
         // the printer will skip straight to the final position anyway.
         // Comments and Unknown commands are transparent (do not break the chain).
-        if let Some((current_axis, current_feed)) = single_axis_travel(cmd) {
+        //
+        // Use the effective command here: if Rule 8 just stripped the feedrate
+        // from this move, Rule 7 must compare against the stripped version so
+        // it does not incorrectly collapse moves that differ only because one
+        // carries a now-removed F parameter.
+        let effective_cmd: &GCodeCommand<'_> =
+            modifications[idx].as_ref().unwrap_or(cmd);
+        if let Some((current_axis, current_feed)) = single_axis_travel(effective_cmd) {
             if let Some((prev_idx, ref prev_travel)) = state.last_single_axis_travel {
                 if prev_travel.axis == current_axis
                     && prev_travel.feedrate == current_feed
@@ -147,11 +197,20 @@ pub fn optimize<'a>(
         // Dry-run: return the original list untouched.
         commands
     } else {
-        // Filter out redundant commands while preserving order.
+        // Filter redundant commands and apply in-place modifications (Rule 8).
         commands
             .into_iter()
-            .zip(redundant.iter())
-            .filter_map(|(cmd, &is_redundant)| if is_redundant { None } else { Some(cmd) })
+            .enumerate()
+            .filter_map(|(idx, mut spanned_cmd)| {
+                if redundant[idx] {
+                    None
+                } else {
+                    if let Some(modified) = modifications[idx].take() {
+                        spanned_cmd.inner = modified;
+                    }
+                    Some(spanned_cmd)
+                }
+            })
             .collect()
     };
 
@@ -311,6 +370,10 @@ fn check_zero_delta_move(axes: MoveAxes, state: &PassState) -> Option<String> {
 /// Tolerance for floating-point position comparisons (0.1 µm).
 const POSITION_TOLERANCE: f64 = 0.000_1;
 
+/// Tolerance for feedrate comparisons (mm/min).
+/// Separate from `POSITION_TOLERANCE` to avoid semantic coupling.
+const FEEDRATE_TOLERANCE: f64 = 0.000_1;
+
 /// Absolute vs relative positioning mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PositioningMode {
@@ -429,6 +492,10 @@ struct PassState {
     /// Rule 7.  Carries forward through `Comment` and `Unknown` commands so
     /// that purely-comment-separated moves are still collapsed.
     last_single_axis_travel: Option<(usize, SingleAxisTravel)>,
+
+    /// Modal feedrate for Rule 8 redundant feedrate elimination.
+    /// `None` until the first `F` parameter is seen on any G0/G1 move.
+    modal_feedrate: Option<f64>,
 }
 
 impl PassState {
@@ -443,6 +510,7 @@ impl PassState {
             last_m140_params: None,
             last_m190_params: None,
             last_single_axis_travel: None,
+            modal_feedrate: None,
         }
     }
 
@@ -512,6 +580,15 @@ impl PassState {
 
             // Comments, Unknown, GCommand, and all other MetaCommands do not
             // affect mode or position state.
+            _ => {}
+        }
+
+        // Track modal feedrate for Rule 8.
+        match cmd {
+            GCodeCommand::RapidMove { f: Some(val), .. }
+            | GCodeCommand::LinearMove { f: Some(val), .. } => {
+                self.modal_feedrate = Some(*val);
+            }
             _ => {}
         }
     }
@@ -804,6 +881,77 @@ mod tests {
         let result = optimize(cmds, &OptConfig::default());
         assert_eq!(result.commands.len(), 2, "different feedrates must both be kept");
         assert!(result.changes.is_empty());
+    }
+
+    // ── Rule 8: redundant feedrate elimination ───────────────────────────
+
+    #[test]
+    fn test_rule8_redundant_feedrate_stripped() {
+        let cmds = vec![
+            spanned(GCodeCommand::LinearMove { x: Some(10.0), y: None, z: None, e: None, f: Some(3000.0) }, 1),
+            spanned(GCodeCommand::LinearMove { x: Some(20.0), y: None, z: None, e: None, f: Some(3000.0) }, 2),
+        ];
+        let result = optimize(cmds, &OptConfig::default());
+        assert_eq!(result.commands.len(), 2, "both moves must survive");
+        match &result.commands[0].inner {
+            GCodeCommand::LinearMove { f, .. } => assert_eq!(*f, Some(3000.0)),
+            other => panic!("expected LinearMove, got {other:?}"),
+        }
+        match &result.commands[1].inner {
+            GCodeCommand::LinearMove { f, .. } => assert_eq!(*f, None, "redundant F should be stripped"),
+            other => panic!("expected LinearMove, got {other:?}"),
+        }
+        assert_eq!(result.changes.len(), 1);
+    }
+
+    #[test]
+    fn test_rule8_first_feedrate_preserved() {
+        let cmds = vec![
+            spanned(GCodeCommand::LinearMove { x: Some(10.0), y: None, z: None, e: None, f: Some(3000.0) }, 1),
+        ];
+        let result = optimize(cmds, &OptConfig::default());
+        match &result.commands[0].inner {
+            GCodeCommand::LinearMove { f, .. } => assert_eq!(*f, Some(3000.0), "first F must be preserved"),
+            other => panic!("expected LinearMove, got {other:?}"),
+        }
+        assert!(result.changes.is_empty());
+    }
+
+    #[test]
+    fn test_rule8_feedrate_change_preserved() {
+        let cmds = vec![
+            spanned(GCodeCommand::LinearMove { x: Some(10.0), y: None, z: None, e: None, f: Some(3000.0) }, 1),
+            spanned(GCodeCommand::LinearMove { x: Some(20.0), y: None, z: None, e: None, f: Some(6000.0) }, 2),
+        ];
+        let result = optimize(cmds, &OptConfig::default());
+        match &result.commands[1].inner {
+            GCodeCommand::LinearMove { f, .. } => assert_eq!(*f, Some(6000.0), "changed F must be preserved"),
+            other => panic!("expected LinearMove, got {other:?}"),
+        }
+        assert!(result.changes.is_empty());
+    }
+
+    #[test]
+    fn test_rule8_rapid_move_feedrate_stripped() {
+        let cmds = vec![
+            spanned(GCodeCommand::RapidMove { x: Some(10.0), y: None, z: None, f: Some(9000.0) }, 1),
+            spanned(GCodeCommand::RapidMove { x: Some(20.0), y: None, z: None, f: Some(9000.0) }, 2),
+        ];
+        let result = optimize(cmds, &OptConfig::default());
+        match &result.commands[1].inner {
+            GCodeCommand::RapidMove { f, .. } => assert_eq!(*f, None, "redundant F on G0 should be stripped"),
+            other => panic!("expected RapidMove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_rule8_no_feedrate_no_change() {
+        let cmds = vec![
+            spanned(g1_at(10.0, 20.0), 1),
+            spanned(g1_at(30.0, 40.0), 2),
+        ];
+        let result = optimize(cmds, &OptConfig::default());
+        assert!(result.changes.is_empty(), "no F means no feedrate change to report");
     }
 
     #[test]
