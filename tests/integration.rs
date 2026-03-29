@@ -275,6 +275,23 @@ fn json_report_valid() {
     );
 }
 
+// ── Per-layer time tracking ──────────────────────────────────────────────────
+
+#[test]
+fn per_layer_times_match_layer_count_malm() {
+    let text = fs::read_to_string(fixture("malm_slide.gcode")).expect("fixture must exist");
+    let cmds = parse_all(&text).expect("must parse");
+    let result = analyze(cmds.iter(), None);
+
+    let diff = (result.stats.per_layer_times.len() as i64 - result.stats.layer_count as i64).abs();
+    assert!(
+        diff <= 1,
+        "per_layer_times.len()={} should be within 1 of layer_count={}",
+        result.stats.per_layer_times.len(),
+        result.stats.layer_count,
+    );
+}
+
 // ── Post-optimization re-analysis ────────────────────────────────────────────
 
 #[test]

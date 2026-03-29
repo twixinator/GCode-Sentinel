@@ -56,6 +56,19 @@ struct PrinterState {
     /// Only merged into `PrintStats::layer_count` at the end if no
     /// `;LAYER_CHANGE` comments were encountered.
     z_layer_count: u32,
+    /// Per-layer times collected via Z-based detection.
+    ///
+    /// Kept separate from `PrintStats::per_layer_times` because we only know
+    /// at the end of the file whether `LAYER_CHANGE` comments are authoritative.
+    /// Merged into `PrintStats::per_layer_times` at finalisation iff no
+    /// `;LAYER_CHANGE` comments were seen.
+    z_layer_times: Vec<f64>,
+    /// Accumulated move time for the current layer (seconds).
+    ///
+    /// Shared between both detection paths.  Reset to zero each time a layer
+    /// boundary is committed (comment path → directly to `PrintStats`; Z path
+    /// → to `z_layer_times`).
+    current_layer_time: f64,
 }
 
 impl Default for PrinterState {
@@ -69,6 +82,8 @@ impl Default for PrinterState {
             last_z: 0.0,
             has_layer_change_comments: false,
             z_layer_count: 0,
+            z_layer_times: Vec::new(),
+            current_layer_time: 0.0,
         }
     }
 }
@@ -155,8 +170,21 @@ pub fn analyze<'a>(
 
     // If the file contained no `;LAYER_CHANGE` comments, fall back to
     // Z-based layer detection.  Otherwise the comment count is authoritative.
-    if !printer.has_layer_change_comments {
+    if printer.has_layer_change_comments {
+        // Comment path: push the final layer's time (the last layer has no
+        // subsequent LAYER_CHANGE to trigger its push).
+        if print_stats.layer_count > 0 {
+            print_stats.per_layer_times.push(printer.current_layer_time);
+        }
+    } else {
+        // Z-based fallback: adopt z_layer_count and z_layer_times.
         print_stats.layer_count = printer.z_layer_count;
+        // Append the final layer's time to the Z buffer, then move the whole
+        // buffer into per_layer_times.
+        if !printer.z_layer_times.is_empty() {
+            printer.z_layer_times.push(printer.current_layer_time);
+        }
+        print_stats.per_layer_times = printer.z_layer_times;
     }
 
     AnalysisResult {
@@ -243,6 +271,11 @@ fn handle_move(
     update_move_stats(travel, outputs.printer.feedrate, outputs.print_stats);
     update_bbox(&dest, outputs.print_stats);
 
+    // Accumulate per-layer time for G0 moves.
+    if outputs.printer.feedrate > 0.0 {
+        outputs.printer.current_layer_time += travel / (outputs.printer.feedrate / 60.0);
+    }
+
     outputs.printer.pos = dest;
 }
 
@@ -284,6 +317,21 @@ fn handle_linear_move(
     // When the file contains `;LAYER_CHANGE` comments (OrcaSlicer), those are the
     // sole source of truth — Z-hops during retraction must not inflate the count.
     if params.target_z.is_some() && dest.z > outputs.printer.last_z {
+        // Push the accumulated time for the layer that just ended into the
+        // Z-based times buffer, then reset.  Only do this in Z-fallback mode:
+        // when LAYER_CHANGE comments are present, `handle_comment` owns the
+        // per-layer time tracking and Z hops must not corrupt the accumulator.
+        if !outputs.printer.has_layer_change_comments {
+            if outputs.printer.current_layer_time > 0.0 || !outputs.printer.z_layer_times.is_empty()
+            {
+                outputs
+                    .printer
+                    .z_layer_times
+                    .push(outputs.printer.current_layer_time);
+            }
+            outputs.printer.current_layer_time = 0.0;
+        }
+
         outputs.printer.z_layer_count += 1;
         outputs.diags.push(Diagnostic {
             severity: Severity::Info,
@@ -300,6 +348,12 @@ fn handle_linear_move(
     let travel = euclidean_distance(&outputs.printer.pos, &dest);
     update_move_stats(travel, outputs.printer.feedrate, outputs.print_stats);
     update_bbox(&dest, outputs.print_stats);
+
+    // Accumulate per-layer time for G1 moves (after the layer-boundary push so
+    // this move's time is attributed to the new layer).
+    if outputs.printer.feedrate > 0.0 {
+        outputs.printer.current_layer_time += travel / (outputs.printer.feedrate / 60.0);
+    }
 
     outputs.printer.pos = dest;
 }
@@ -353,6 +407,12 @@ fn handle_comment<S: AsRef<str>>(
     if text.as_ref() == "LAYER_CHANGE" {
         printer.has_layer_change_comments = true;
         print_stats.layer_count += 1;
+        // Push the accumulated time for the layer that just ended, then reset.
+        // Any moves that follow belong to the new layer.
+        if printer.current_layer_time > 0.0 || !print_stats.per_layer_times.is_empty() {
+            print_stats.per_layer_times.push(printer.current_layer_time);
+        }
+        printer.current_layer_time = 0.0;
     }
 }
 
@@ -837,6 +897,82 @@ mod tests {
             .collect();
         assert_eq!(w001.len(), 1);
         assert_eq!(w001[0].severity, Severity::Warning);
+    }
+
+    // ── Per-layer time tracking ──────────────────────────────────────────
+
+    #[test]
+    fn test_per_layer_times_populated() {
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(
+                GCodeCommand::Comment {
+                    text: Cow::Borrowed("LAYER_CHANGE"),
+                },
+                2,
+            ),
+            sp(
+                linear(Some(100.0), None, Some(0.2), Some(1.0), Some(6000.0)),
+                3,
+            ),
+            sp(
+                GCodeCommand::Comment {
+                    text: Cow::Borrowed("LAYER_CHANGE"),
+                },
+                4,
+            ),
+            sp(
+                linear(Some(300.0), None, Some(0.4), Some(2.0), Some(6000.0)),
+                5,
+            ),
+        ];
+        let result = analyze(cmds.iter(), None);
+        assert_eq!(
+            result.stats.per_layer_times.len(),
+            2,
+            "should have 2 layer times"
+        );
+        assert!(
+            (result.stats.per_layer_times[0] - 1.0).abs() < 0.1,
+            "layer 1 time should be ~1.0s, got {}",
+            result.stats.per_layer_times[0]
+        );
+        assert!(
+            result.stats.per_layer_times[1] > 0.0,
+            "layer 2 time should be > 0, got {}",
+            result.stats.per_layer_times[1]
+        );
+    }
+
+    #[test]
+    fn test_per_layer_times_z_fallback() {
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(
+                linear(Some(100.0), None, Some(0.2), Some(1.0), Some(6000.0)),
+                2,
+            ),
+            sp(
+                linear(Some(200.0), None, Some(0.4), Some(2.0), Some(6000.0)),
+                3,
+            ),
+        ];
+        let result = analyze(cmds.iter(), None);
+        assert_eq!(
+            result.stats.per_layer_times.len(),
+            2,
+            "Z-based layers should also track times"
+        );
+    }
+
+    #[test]
+    fn test_per_layer_times_empty_for_no_layers() {
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(linear(Some(10.0), Some(20.0), None, None, None), 2),
+        ];
+        let result = analyze(cmds.iter(), None);
+        assert!(result.stats.per_layer_times.is_empty());
     }
 
     // ── 10. Filament accounting: only positive deltas count ──────────────────
