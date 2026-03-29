@@ -14,6 +14,7 @@
 //! | 3 | Duplicate consecutive fan command — M106/M107 with same params |
 //! | 4 | Zero-delta move — absolute move to current position with no feedrate change |
 //! | 5 | Duplicate consecutive temperature command — M104/M109/M140/M190 |
+//! | 7 | Consecutive same-axis travel — first non-extruding single-axis move superseded by next |
 //!
 //! # Dry-run mode
 //!
@@ -103,6 +104,39 @@ pub fn optimize<'a>(
             });
         }
 
+        // ── Rule 7: consecutive same-axis travel ─────────────────────────────
+        // When a new single-axis non-extruding move supersedes a prior one on
+        // the same axis with the same feedrate, the prior move is redundant —
+        // the printer will skip straight to the final position anyway.
+        // Comments and Unknown commands are transparent (do not break the chain).
+        if let Some((current_axis, current_feed)) = single_axis_travel(cmd) {
+            if let Some((prev_idx, ref prev_travel)) = state.last_single_axis_travel {
+                if prev_travel.axis == current_axis
+                    && prev_travel.feedrate == current_feed
+                    && !redundant[prev_idx]
+                {
+                    redundant[prev_idx] = true;
+                    changes.push(OptimizationChange {
+                        line: commands[prev_idx].line,
+                        description: "redundant same-axis travel (superseded by next move)"
+                            .to_owned(),
+                    });
+                }
+            }
+            state.last_single_axis_travel =
+                Some((idx, SingleAxisTravel { axis: current_axis, feedrate: current_feed }));
+        } else {
+            match cmd {
+                // Comments and unknown tokens are transparent — preserve the
+                // pending travel so it can still be matched by a later move.
+                GCodeCommand::Comment { .. } | GCodeCommand::Unknown { .. } => {}
+                // Any other real command breaks the detection chain.
+                _ => {
+                    state.last_single_axis_travel = None;
+                }
+            }
+        }
+
         // Always advance state — even redundant commands affect mode tracking
         // (e.g. a duplicate G90 still leaves us in absolute mode).
         state.update(cmd);
@@ -120,6 +154,11 @@ pub fn optimize<'a>(
             .filter_map(|(cmd, &is_redundant)| if is_redundant { None } else { Some(cmd) })
             .collect()
     };
+
+    // Rule 7 can push change entries out of source order (the redundant
+    // command is the *earlier* one, but it is discovered while processing the
+    // *later* command).  Sort so callers always see changes in line order.
+    changes.sort_by_key(|c| c.line);
 
     OptimizationResult {
         commands: output_commands,
@@ -312,6 +351,55 @@ impl Default for PositionState {
     }
 }
 
+/// Which single axis a non-extruding travel move affected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SingleAxis {
+    X,
+    Y,
+    Z,
+}
+
+/// State for Rule 7: last single-axis non-extruding travel.
+#[derive(Debug, Clone)]
+struct SingleAxisTravel {
+    axis: SingleAxis,
+    feedrate: Option<f64>,
+}
+
+/// Returns the single axis affected by a non-extruding move, or `None`.
+///
+/// A qualifying move must set exactly one of X/Y/Z, must not set E (no
+/// extrusion), and must be a `RapidMove` or `LinearMove`.
+fn single_axis_travel(cmd: &GCodeCommand<'_>) -> Option<(SingleAxis, Option<f64>)> {
+    let params = match cmd {
+        GCodeCommand::RapidMove { x, y, z, f } => {
+            MoveAxes { x_pos: *x, y_pos: *y, z_pos: *z, extrude: None, feed: *f }
+        }
+        GCodeCommand::LinearMove { x, y, z, e, f } => {
+            MoveAxes { x_pos: *x, y_pos: *y, z_pos: *z, extrude: *e, feed: *f }
+        }
+        _ => return None,
+    };
+    if params.extrude.is_some() {
+        return None;
+    }
+    let x_set = params.x_pos.is_some();
+    let y_set = params.y_pos.is_some();
+    let z_set = params.z_pos.is_some();
+    let count = u8::from(x_set) + u8::from(y_set) + u8::from(z_set);
+    if count != 1 {
+        return None;
+    }
+    let affected = if x_set {
+        SingleAxis::X
+    } else if y_set {
+        SingleAxis::Y
+    } else {
+        SingleAxis::Z
+    };
+    Some((affected, params.feed))
+}
+
 /// All mutable state maintained during a single optimizer pass.
 #[derive(Debug)]
 struct PassState {
@@ -336,6 +424,11 @@ struct PassState {
     last_m140_params: Option<String>,
     /// Parameter string of the last M190 seen (bed temp, wait).
     last_m190_params: Option<String>,
+
+    /// Index and details of the last single-axis non-extruding travel, for
+    /// Rule 7.  Carries forward through `Comment` and `Unknown` commands so
+    /// that purely-comment-separated moves are still collapsed.
+    last_single_axis_travel: Option<(usize, SingleAxisTravel)>,
 }
 
 impl PassState {
@@ -349,6 +442,7 @@ impl PassState {
             last_m109_params: None,
             last_m140_params: None,
             last_m190_params: None,
+            last_single_axis_travel: None,
         }
     }
 
@@ -647,6 +741,92 @@ mod tests {
         let result = optimize(cmds, &OptConfig::default());
         assert_eq!(result.commands.len(), 2, "zero move in relative mode must be kept");
         assert!(result.changes.is_empty());
+    }
+
+    fn g0_x(x: f64) -> GCodeCommand<'static> {
+        GCodeCommand::RapidMove { x: Some(x), y: None, z: None, f: None }
+    }
+
+    fn g0_x_f(x: f64, f: f64) -> GCodeCommand<'static> {
+        GCodeCommand::RapidMove { x: Some(x), y: None, z: None, f: Some(f) }
+    }
+
+    fn g0_y(y: f64) -> GCodeCommand<'static> {
+        GCodeCommand::RapidMove { x: None, y: Some(y), z: None, f: None }
+    }
+
+    fn g1_x_e(x: f64, e: f64) -> GCodeCommand<'static> {
+        GCodeCommand::LinearMove { x: Some(x), y: None, z: None, e: Some(e), f: None }
+    }
+
+    // ── Rule 7: consecutive same-axis travel merging ─────────────────────────
+
+    #[test]
+    fn test_rule7_same_axis_rapid_first_removed() {
+        let cmds = vec![
+            spanned(g0_x(10.0), 1),
+            spanned(g0_x(20.0), 2),
+        ];
+        let result = optimize(cmds, &OptConfig::default());
+        assert_eq!(result.commands.len(), 1, "first G0 X should be removed");
+        assert_eq!(result.commands[0].line, 2);
+        assert_eq!(result.changes.len(), 1);
+    }
+
+    #[test]
+    fn test_rule7_different_axes_both_kept() {
+        let cmds = vec![
+            spanned(g0_x(10.0), 1),
+            spanned(g0_y(20.0), 2),
+        ];
+        let result = optimize(cmds, &OptConfig::default());
+        assert_eq!(result.commands.len(), 2, "different axes must both be kept");
+        assert!(result.changes.is_empty());
+    }
+
+    #[test]
+    fn test_rule7_extruding_moves_both_kept() {
+        let cmds = vec![
+            spanned(g1_x_e(10.0, 1.0), 1),
+            spanned(g1_x_e(20.0, 2.0), 2),
+        ];
+        let result = optimize(cmds, &OptConfig::default());
+        assert_eq!(result.commands.len(), 2, "extruding moves must both be kept");
+        assert!(result.changes.is_empty());
+    }
+
+    #[test]
+    fn test_rule7_different_feedrates_both_kept() {
+        let cmds = vec![
+            spanned(g0_x_f(10.0, 3000.0), 1),
+            spanned(g0_x_f(20.0, 6000.0), 2),
+        ];
+        let result = optimize(cmds, &OptConfig::default());
+        assert_eq!(result.commands.len(), 2, "different feedrates must both be kept");
+        assert!(result.changes.is_empty());
+    }
+
+    #[test]
+    fn test_rule7_comment_between_still_removed() {
+        let cmds = vec![
+            spanned(g0_x(10.0), 1),
+            spanned(GCodeCommand::Comment { text: Cow::Borrowed("move") }, 2),
+            spanned(g0_x(20.0), 3),
+        ];
+        let result = optimize(cmds, &OptConfig::default());
+        assert_eq!(result.commands.len(), 2, "first G0 X should be removed through comment");
+        let kept_lines: Vec<u32> = result.commands.iter().map(|s| s.line).collect();
+        assert_eq!(kept_lines, vec![2, 3]);
+    }
+
+    #[test]
+    fn test_rule7_multi_axis_move_not_matched() {
+        let cmds = vec![
+            spanned(GCodeCommand::RapidMove { x: Some(10.0), y: Some(20.0), z: None, f: None }, 1),
+            spanned(GCodeCommand::RapidMove { x: Some(30.0), y: Some(40.0), z: None, f: None }, 2),
+        ];
+        let result = optimize(cmds, &OptConfig::default());
+        assert_eq!(result.commands.len(), 2, "multi-axis moves must both be kept");
     }
 
     // ── Rule 5: duplicate temperature command ─────────────────────────────────
