@@ -25,7 +25,11 @@ pub enum ReportFormat {
 // Refactoring into enums would only add indirection without semantic benefit.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Parser)]
-#[command(author, version, about = "High-performance G-Code validator and optimizer for 3D printing")]
+#[command(
+    author,
+    version,
+    about = "High-performance G-Code validator and optimizer for 3D printing"
+)]
 pub struct Cli {
     /// Path to the input G-Code file to process.
     pub input: PathBuf,
@@ -163,13 +167,8 @@ mod tests {
 
     #[test]
     fn report_format_json_is_parsed() {
-        let cli = Cli::try_parse_from([
-            "gcode-sentinel",
-            "input.gcode",
-            "--report-format",
-            "json",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["gcode-sentinel", "input.gcode", "--report-format", "json"])
+            .unwrap();
         assert!(matches!(cli.report_format, ReportFormat::Json));
     }
 

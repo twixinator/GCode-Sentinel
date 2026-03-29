@@ -37,7 +37,10 @@ fn main() -> Result<()> {
     // JSON-to-stdout without --report-file implies check-only (no G-Code written).
     let effective_dry_run =
         cli.check_only || (cli.report_format == ReportFormat::Json && cli.report_file.is_none());
-    let opt_config = OptConfig { dry_run: effective_dry_run, ..Default::default() };
+    let opt_config = OptConfig {
+        dry_run: effective_dry_run,
+        ..Default::default()
+    };
     let opt_result = optimize(commands, &opt_config);
     log_optimization(opt_result.changes.len(), effective_dry_run);
 
@@ -88,14 +91,13 @@ fn main() -> Result<()> {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn init_tracing(verbose: bool) -> Result<()> {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| {
-            if verbose {
-                tracing_subscriber::EnvFilter::new("debug")
-            } else {
-                tracing_subscriber::EnvFilter::new("info")
-            }
-        });
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        if verbose {
+            tracing_subscriber::EnvFilter::new("debug")
+        } else {
+            tracing_subscriber::EnvFilter::new("info")
+        }
+    });
     let subscriber = tracing_subscriber::fmt().with_env_filter(filter).finish();
     tracing::subscriber::set_global_default(subscriber)
         .context("failed to initialise tracing subscriber")
@@ -112,9 +114,7 @@ fn validate_input(cli: &Cli) -> Result<()> {
 }
 
 fn validate_cli_flags(cli: &Cli) -> Result<()> {
-    if cli.report_format == ReportFormat::Json
-        && cli.report_file.is_none()
-        && cli.output.is_some()
+    if cli.report_format == ReportFormat::Json && cli.report_file.is_none() && cli.output.is_some()
     {
         anyhow::bail!(
             "--report-format json without --report-file cannot be combined with --output \
@@ -126,7 +126,12 @@ fn validate_cli_flags(cli: &Cli) -> Result<()> {
 
 fn log_limits(limits: Option<&gcode_sentinel::models::MachineLimits>) {
     if let Some(lim) = limits {
-        info!(max_x = lim.max_x, max_y = lim.max_y, max_z = lim.max_z, "machine limits loaded");
+        info!(
+            max_x = lim.max_x,
+            max_y = lim.max_y,
+            max_z = lim.max_z,
+            "machine limits loaded"
+        );
     } else {
         info!("no machine limits provided — out-of-bounds checking disabled");
     }
@@ -153,15 +158,24 @@ fn log_analysis(diagnostics: &[gcode_sentinel::diagnostics::Diagnostic]) {
     if diagnostics.is_empty() {
         info!("analysis complete — no issues found");
     } else {
-        let errors = diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
-        let warnings = diagnostics.iter().filter(|d| d.severity == Severity::Warning).count();
+        let errors = diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count();
+        let warnings = diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .count();
         info!(errors, warnings, "analysis complete");
     }
 }
 
 fn log_optimization(change_count: usize, dry_run: bool) {
     if dry_run {
-        info!(proposed_removals = change_count, "dry-run: no output written");
+        info!(
+            proposed_removals = change_count,
+            "dry-run: no output written"
+        );
     } else {
         info!(removed = change_count, "optimization complete");
     }
@@ -182,7 +196,9 @@ fn build_report(
 
 fn print_report(report: &AnalysisReport) -> Result<()> {
     let mut summary = String::new();
-    report.write_summary(&mut summary).context("failed to format report")?;
+    report
+        .write_summary(&mut summary)
+        .context("failed to format report")?;
     eprintln!("{summary}");
     if report.has_errors() {
         warn!(

@@ -32,7 +32,11 @@ fn round_trip_malm_slide() {
     let text2 = String::from_utf8(buf1.clone()).expect("emitted output must be valid UTF-8");
     let cmds2 = parse_all(&text2).expect("re-parsed output must parse");
 
-    assert_eq!(cmds.len(), cmds2.len(), "command count must be identical after round-trip");
+    assert_eq!(
+        cmds.len(),
+        cmds2.len(),
+        "command count must be identical after round-trip"
+    );
 
     let mut buf2 = Vec::new();
     emit(&cmds2, &mut buf2, &EmitConfig::default()).expect("second emit must succeed");
@@ -54,7 +58,11 @@ fn round_trip_rose() {
     let text2 = String::from_utf8(buf1.clone()).expect("emitted output must be valid UTF-8");
     let cmds2 = parse_all(&text2).expect("re-parsed output must parse");
 
-    assert_eq!(cmds.len(), cmds2.len(), "command count must be identical after round-trip");
+    assert_eq!(
+        cmds.len(),
+        cmds2.len(),
+        "command count must be identical after round-trip"
+    );
 
     let mut buf2 = Vec::new();
     emit(&cmds2, &mut buf2, &EmitConfig::default()).expect("second emit must succeed");
@@ -73,14 +81,23 @@ fn analyze_malm_slide_layers() {
     let cmds = parse_all(&text).expect("must parse");
     let result = analyze(cmds.iter(), None);
 
-    assert_eq!(result.stats.layer_count, 255, "malm_slide must have 255 layers");
+    assert_eq!(
+        result.stats.layer_count, 255,
+        "malm_slide must have 255 layers"
+    );
     assert!(
         (result.stats.bbox_max.z - 51.45).abs() < 0.1,
         "malm_slide bbox_max.z must be ~51.45, got {}",
         result.stats.bbox_max.z
     );
-    assert!(result.stats.total_filament_mm > 0.0, "total_filament_mm must be > 0");
-    assert!(result.stats.estimated_time_seconds > 0.0, "estimated_time_seconds must be > 0");
+    assert!(
+        result.stats.total_filament_mm > 0.0,
+        "total_filament_mm must be > 0"
+    );
+    assert!(
+        result.stats.estimated_time_seconds > 0.0,
+        "estimated_time_seconds must be > 0"
+    );
 }
 
 #[test]
@@ -95,13 +112,23 @@ fn analyze_rose_layers() {
         "rose bbox_max.z must be ~120.45, got {}",
         result.stats.bbox_max.z
     );
-    assert!(result.stats.total_filament_mm > 0.0, "total_filament_mm must be > 0");
-    assert!(result.stats.estimated_time_seconds > 0.0, "estimated_time_seconds must be > 0");
+    assert!(
+        result.stats.total_filament_mm > 0.0,
+        "total_filament_mm must be > 0"
+    );
+    assert!(
+        result.stats.estimated_time_seconds > 0.0,
+        "estimated_time_seconds must be > 0"
+    );
 }
 
 #[test]
 fn analyze_no_errors_in_bounds() {
-    let limits = MachineLimits { max_x: 300.0, max_y: 300.0, max_z: 400.0 };
+    let limits = MachineLimits {
+        max_x: 300.0,
+        max_y: 300.0,
+        max_z: 400.0,
+    };
 
     for name in &["malm_slide.gcode", "rose.gcode"] {
         let text = fs::read_to_string(fixture(name))
@@ -128,7 +155,10 @@ fn optimize_idempotent_malm() {
     let text = fs::read_to_string(fixture("malm_slide.gcode")).expect("fixture must exist");
     let cmds = parse_all(&text).expect("must parse");
 
-    let config = OptConfig { dry_run: false, ..Default::default() };
+    let config = OptConfig {
+        dry_run: false,
+        ..Default::default()
+    };
     let pass1 = optimize(cmds, &config);
     let pass2 = optimize(pass1.commands, &config);
 
@@ -144,7 +174,10 @@ fn optimize_idempotent_rose() {
     let text = fs::read_to_string(fixture("rose.gcode")).expect("fixture must exist");
     let cmds = parse_all(&text).expect("must parse");
 
-    let config = OptConfig { dry_run: false, ..Default::default() };
+    let config = OptConfig {
+        dry_run: false,
+        ..Default::default()
+    };
     let pass1 = optimize(cmds, &config);
     let pass2 = optimize(pass1.commands, &config);
 
@@ -165,7 +198,13 @@ fn optimize_preserves_extrusion() {
         let cmds = parse_all(&text).unwrap_or_else(|_| panic!("{name} must parse"));
 
         let pre = analyze(cmds.iter(), None);
-        let opt = optimize(cmds, &OptConfig { dry_run: false, ..Default::default() });
+        let opt = optimize(
+            cmds,
+            &OptConfig {
+                dry_run: false,
+                ..Default::default()
+            },
+        );
         let post = analyze(opt.commands.iter(), None);
 
         assert!(
@@ -185,7 +224,13 @@ fn optimize_preserves_bbox() {
         let cmds = parse_all(&text).unwrap_or_else(|_| panic!("{name} must parse"));
 
         let pre = analyze(cmds.iter(), None);
-        let opt = optimize(cmds, &OptConfig { dry_run: false, ..Default::default() });
+        let opt = optimize(
+            cmds,
+            &OptConfig {
+                dry_run: false,
+                ..Default::default()
+            },
+        );
         let post = analyze(opt.commands.iter(), None);
 
         assert_eq!(
@@ -240,7 +285,13 @@ fn post_opt_reanalysis_no_regression() {
         let cmds = parse_all(&text).unwrap_or_else(|_| panic!("{name} must parse"));
 
         let pre = analyze(cmds.iter(), None);
-        let opt = optimize(cmds, &OptConfig { dry_run: false, ..Default::default() });
+        let opt = optimize(
+            cmds,
+            &OptConfig {
+                dry_run: false,
+                ..Default::default()
+            },
+        );
         let post = analyze(opt.commands.iter(), None);
 
         let diff = ValidationDiff::compute(&pre.diagnostics, &post.diagnostics);

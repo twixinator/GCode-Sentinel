@@ -176,12 +176,7 @@ fn process_command<'a>(
     limits: Option<&MachineLimits>,
 ) {
     match &spanned.inner {
-        GCodeCommand::RapidMove {
-            x,
-            y,
-            z,
-            f,
-        } => {
+        GCodeCommand::RapidMove { x, y, z, f } => {
             let params = AxisParams {
                 target_x: *x,
                 target_y: *y,
@@ -296,8 +291,7 @@ fn handle_linear_move(
             code: "I001",
             message: format!(
                 "layer change detected: Z {:.3} → {:.3}",
-                outputs.printer.last_z,
-                dest.z,
+                outputs.printer.last_z, dest.z,
             ),
         });
         outputs.printer.last_z = dest.z;
@@ -574,8 +568,14 @@ mod tests {
     fn test_absolute_move_bbox() {
         let cmds = vec![
             sp(GCodeCommand::SetAbsolute, 1),
-            sp(linear(Some(10.0), Some(20.0), Some(5.0), Some(1.0), None), 2),
-            sp(linear(Some(50.0), Some(80.0), Some(5.0), Some(2.0), None), 3),
+            sp(
+                linear(Some(10.0), Some(20.0), Some(5.0), Some(1.0), None),
+                2,
+            ),
+            sp(
+                linear(Some(50.0), Some(80.0), Some(5.0), Some(2.0), None),
+                3,
+            ),
         ];
         let result = analyze(cmds.iter(), None);
 
