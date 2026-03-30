@@ -10,7 +10,7 @@ use gcode_sentinel::analyzer::analyze;
 use gcode_sentinel::diagnostics::{AnalysisReport, Severity, ValidationDiff};
 use gcode_sentinel::emitter::{emit, EmitConfig};
 use gcode_sentinel::models::MachineLimits;
-use gcode_sentinel::optimizer::{optimize, OptConfig};
+use gcode_sentinel::optimizer::{insert_progress_markers, optimize, OptConfig};
 use gcode_sentinel::parser::parse_all;
 
 fn fixture(name: &str) -> PathBuf {
@@ -308,6 +308,44 @@ fn no_temp_tower_in_malm_slide() {
         i003.is_empty(),
         "malm_slide is not a temp tower — I003 should not fire"
     );
+}
+
+// ── M73 progress marker insertion ────────────────────────────────────────────
+
+#[test]
+fn m73_insertion_malm_slide() {
+    let text = fs::read_to_string(fixture("malm_slide.gcode")).expect("fixture must exist");
+    let cmds = parse_all(&text).expect("must parse");
+    let pre = analyze(cmds.iter(), None);
+
+    let config = OptConfig {
+        insert_progress: true,
+        ..Default::default()
+    };
+    let opt = optimize(cmds, &OptConfig::default());
+    let result = insert_progress_markers(
+        opt.commands,
+        pre.stats.estimated_time_seconds,
+        pre.stats.layer_count,
+        &config,
+    );
+
+    let m73_count = result
+        .commands
+        .iter()
+        .filter(|c| {
+            matches!(
+                &c.inner,
+                gcode_sentinel::models::GCodeCommand::MetaCommand { code: 73, .. }
+            )
+        })
+        .count();
+
+    assert_eq!(
+        m73_count, 255,
+        "malm_slide has 255 layers, should get 255 M73 markers"
+    );
+    assert_eq!(result.diagnostics.len(), 255);
 }
 
 // ── Post-optimization re-analysis ────────────────────────────────────────────

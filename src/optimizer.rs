@@ -24,7 +24,9 @@
 
 #![warn(clippy::pedantic)]
 
-use crate::diagnostics::OptimizationChange;
+use std::borrow::Cow;
+
+use crate::diagnostics::{Diagnostic, OptimizationChange, Severity};
 use crate::models::{GCodeCommand, Spanned};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -566,6 +568,184 @@ fn flush_run(
         }
     }
     current_run.clear();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Post-pass: M73 progress marker insertion
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Result of the M73 progress marker insertion pass.
+#[derive(Debug)]
+pub struct ProgressInsertionResult<'a> {
+    /// The command list with existing M73s stripped and new ones inserted at
+    /// layer boundaries.
+    pub commands: Vec<Spanned<GCodeCommand<'a>>>,
+    /// One `I002` informational diagnostic per inserted M73 marker.
+    pub diagnostics: Vec<crate::diagnostics::Diagnostic>,
+}
+
+/// Post-pass: strip existing M73 commands and insert recalculated progress
+/// markers at layer boundaries (both `;LAYER_CHANGE` and Z-increase fallback).
+///
+/// Returns immediately with the original command list when
+/// `config.insert_progress` is `false`.
+///
+/// Layer boundaries are detected via:
+/// 1. A `Comment` whose text is exactly `"LAYER_CHANGE"` (slicer annotation).
+/// 2. A `LinearMove` or `RapidMove` that increases the Z axis relative to the
+///    last known Z value (fallback for files without layer-change comments).
+///
+/// When both signals are present in a file, only the comment-based signal fires
+/// (the Z-increase fallback is suppressed after a `LAYER_CHANGE` comment is
+/// seen for that boundary, preventing double-counting).
+///
+/// # Panics
+///
+/// Does not panic under any input.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn insert_progress_markers<'a>(
+    commands: Vec<Spanned<GCodeCommand<'a>>>,
+    estimated_time_seconds: f64,
+    layer_count: u32,
+    config: &OptConfig,
+) -> ProgressInsertionResult<'a> {
+    if !config.insert_progress {
+        return ProgressInsertionResult {
+            commands,
+            diagnostics: Vec::new(),
+        };
+    }
+
+    // Safety cap: never emit more markers than the known layer count.
+    let effective_layer_count = layer_count.max(1);
+
+    // ── Phase 1: strip existing M73 commands ─────────────────────────────────
+    let stripped: Vec<Spanned<GCodeCommand<'a>>> = commands
+        .into_iter()
+        .filter(|s| !matches!(s.inner, GCodeCommand::MetaCommand { code: 73, .. }))
+        .collect();
+
+    // ── Phase 2: walk and insert at layer boundaries ──────────────────────────
+    //
+    // Two boundary signals:
+    //   A) Comment text == "LAYER_CHANGE"
+    //   B) Z-increase on a move (suppressed for the move immediately following
+    //      a LAYER_CHANGE comment, to avoid double-counting)
+    //
+    // We build the output by appending commands one at a time and inserting a
+    // synthetic M73 after the triggering command whenever a boundary fires.
+
+    let mut output: Vec<Spanned<GCodeCommand<'a>>> = Vec::with_capacity(stripped.len() + effective_layer_count as usize);
+    let mut diagnostics: Vec<Diagnostic> = Vec::new();
+
+    let mut layers_seen: u32 = 0;
+    // Last Z value seen from any move command.
+    let mut last_z: Option<f64> = None;
+    // True when the immediately-preceding real command was a LAYER_CHANGE
+    // comment; in that case the next Z-increase does not trigger a second
+    // boundary event.
+    let mut layer_change_comment_pending = false;
+
+    for spanned in stripped {
+        let is_layer_change_comment = matches!(
+            &spanned.inner,
+            GCodeCommand::Comment { text } if text.as_ref() == "LAYER_CHANGE"
+        );
+
+        // Determine whether this command carries a new Z value.
+        let move_z = match &spanned.inner {
+            GCodeCommand::LinearMove { z, .. } | GCodeCommand::RapidMove { z, .. } => *z,
+            _ => None,
+        };
+
+        // Determine trigger type before moving `spanned` into `output`.
+        let trigger_line = spanned.line;
+        let trigger_is_layer_change = is_layer_change_comment;
+
+        // Check for Z-increase boundary (fallback signal).
+        let z_increase_boundary = if let Some(z_new) = move_z {
+            let is_increase = last_z.map_or(true, |z_old| z_new > z_old + 1e-9);
+            if is_increase {
+                // Suppress if a LAYER_CHANGE comment immediately preceded this move.
+                !layer_change_comment_pending
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Advance last_z before pushing so state is correct for following cmds.
+        if let Some(z_new) = move_z {
+            // Only advance if Z actually increased (we do not track retracts as layer changes).
+            if last_z.map_or(true, |z_old| z_new > z_old + 1e-9) {
+                last_z = Some(z_new);
+            } else if last_z.map_or(true, |z_old| z_new >= z_old - 1e-9) {
+                // Same or lower Z — still update last_z so we track current position.
+                last_z = Some(z_new);
+            }
+        }
+
+        output.push(spanned);
+
+        // After pushing, reset the pending-comment flag if this was a real move.
+        if move_z.is_some() {
+            layer_change_comment_pending = false;
+        }
+
+        // Determine whether to insert a marker after this command.
+        let should_insert = if trigger_is_layer_change {
+            // Set flag so next Z-increase won't also fire.
+            layer_change_comment_pending = true;
+            true
+        } else {
+            z_increase_boundary
+        };
+
+        if should_insert && layers_seen < effective_layer_count {
+            layers_seen += 1;
+
+            // percent = layers_seen / layer_count * 100, capped at 100.
+            let percent = ((f64::from(layers_seen) / f64::from(effective_layer_count)) * 100.0)
+                .round()
+                .min(100.0) as u32;
+
+            // remaining_fraction is the proportion of time not yet elapsed.
+            let elapsed_fraction =
+                (f64::from(layers_seen) / f64::from(effective_layer_count)).min(1.0);
+            let remaining_fraction = (1.0 - elapsed_fraction).max(0.0);
+            let remaining_minutes =
+                ((estimated_time_seconds * remaining_fraction) / 60.0).round() as u32;
+
+            let params = format!("P{percent} R{remaining_minutes}");
+
+            // Synthetic command: line 0, byte_offset 0 (no source location).
+            let m73 = Spanned {
+                inner: GCodeCommand::MetaCommand {
+                    code: 73,
+                    params: Cow::Owned(params.clone()),
+                },
+                line: 0,
+                byte_offset: 0,
+            };
+            output.push(m73);
+
+            diagnostics.push(Diagnostic {
+                severity: Severity::Info,
+                line: trigger_line,
+                code: "I002",
+                message: format!(
+                    "inserted M73 {params} at layer {layers_seen}/{effective_layer_count}"
+                ),
+            });
+        }
+    }
+
+    ProgressInsertionResult {
+        commands: output,
+        diagnostics,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1841,6 +2021,220 @@ mod tests {
         assert!(
             !result.changes.is_empty(),
             "dry-run must still report changes"
+        );
+    }
+
+    // ── M73 progress marker insertion ────────────────────────────────────────
+
+    fn progress_config() -> OptConfig {
+        OptConfig {
+            dry_run: false,
+            merge_collinear: false,
+            insert_progress: true,
+        }
+    }
+
+    #[test]
+    fn test_m73_inserted_at_layer_boundaries() {
+        let cmds = vec![
+            spanned(GCodeCommand::SetAbsolute, 1),
+            spanned(
+                GCodeCommand::Comment {
+                    text: Cow::Borrowed("LAYER_CHANGE"),
+                },
+                2,
+            ),
+            spanned(
+                GCodeCommand::LinearMove {
+                    x: Some(10.0),
+                    y: None,
+                    z: Some(0.2),
+                    e: Some(1.0),
+                    f: Some(3000.0),
+                },
+                3,
+            ),
+            spanned(
+                GCodeCommand::Comment {
+                    text: Cow::Borrowed("LAYER_CHANGE"),
+                },
+                4,
+            ),
+            spanned(
+                GCodeCommand::LinearMove {
+                    x: Some(20.0),
+                    y: None,
+                    z: Some(0.4),
+                    e: Some(2.0),
+                    f: None,
+                },
+                5,
+            ),
+        ];
+        let result = insert_progress_markers(cmds, 120.0, 2, &progress_config());
+        let m73s: Vec<_> = result
+            .commands
+            .iter()
+            .filter(|c| {
+                matches!(
+                    &c.inner,
+                    GCodeCommand::MetaCommand { code: 73, .. }
+                )
+            })
+            .collect();
+        assert!(
+            m73s.len() >= 2,
+            "should insert M73 at each layer boundary, got {}",
+            m73s.len()
+        );
+        let i002: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "I002")
+            .collect();
+        assert_eq!(i002.len(), m73s.len());
+    }
+
+    #[test]
+    fn test_m73_existing_stripped() {
+        let cmds = vec![
+            spanned(
+                GCodeCommand::MetaCommand {
+                    code: 73,
+                    params: Cow::Borrowed("P50 R30"),
+                },
+                1,
+            ),
+            spanned(GCodeCommand::SetAbsolute, 2),
+            spanned(
+                GCodeCommand::Comment {
+                    text: Cow::Borrowed("LAYER_CHANGE"),
+                },
+                3,
+            ),
+            spanned(
+                GCodeCommand::LinearMove {
+                    x: Some(10.0),
+                    y: None,
+                    z: Some(0.2),
+                    e: Some(1.0),
+                    f: Some(3000.0),
+                },
+                4,
+            ),
+        ];
+        let result = insert_progress_markers(cmds, 60.0, 1, &progress_config());
+        let old_m73s: Vec<_> = result
+            .commands
+            .iter()
+            .filter(|c| match &c.inner {
+                GCodeCommand::MetaCommand { code: 73, params } => params.as_ref() == "P50 R30",
+                _ => false,
+            })
+            .collect();
+        assert!(old_m73s.is_empty(), "existing M73 should be stripped");
+    }
+
+    #[test]
+    fn test_m73_disabled_by_default() {
+        let cmds = vec![
+            spanned(
+                GCodeCommand::Comment {
+                    text: Cow::Borrowed("LAYER_CHANGE"),
+                },
+                1,
+            ),
+            spanned(
+                GCodeCommand::LinearMove {
+                    x: Some(10.0),
+                    y: None,
+                    z: Some(0.2),
+                    e: Some(1.0),
+                    f: Some(3000.0),
+                },
+                2,
+            ),
+        ];
+        let result = insert_progress_markers(cmds, 60.0, 1, &OptConfig::default());
+        assert!(result.diagnostics.is_empty());
+        assert_eq!(result.commands.len(), 2);
+    }
+
+    #[test]
+    fn test_m73_progress_spans_0_to_100() {
+        let mut cmds = vec![spanned(GCodeCommand::SetAbsolute, 1)];
+        for i in 0..4u32 {
+            cmds.push(spanned(
+                GCodeCommand::Comment {
+                    text: Cow::Borrowed("LAYER_CHANGE"),
+                },
+                i * 2 + 2,
+            ));
+            cmds.push(spanned(
+                GCodeCommand::LinearMove {
+                    x: Some(10.0 * f64::from(i + 1)),
+                    y: None,
+                    z: Some(0.2 * f64::from(i + 1)),
+                    e: Some(f64::from(i + 1)),
+                    f: Some(3000.0),
+                },
+                i * 2 + 3,
+            ));
+        }
+        let result = insert_progress_markers(cmds, 240.0, 4, &progress_config());
+        let m73_params: Vec<String> = result
+            .commands
+            .iter()
+            .filter_map(|c| match &c.inner {
+                GCodeCommand::MetaCommand { code: 73, params } => Some(params.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(!m73_params.is_empty());
+        let last = m73_params.last().expect("at least one M73");
+        assert!(last.contains("P100"), "last M73 should be P100, got {last}");
+    }
+
+    #[test]
+    fn test_m73_z_increase_detection() {
+        // No LAYER_CHANGE comments — relies on Z-increase fallback.
+        let cmds = vec![
+            spanned(GCodeCommand::SetAbsolute, 1),
+            spanned(
+                GCodeCommand::LinearMove {
+                    x: Some(10.0),
+                    y: None,
+                    z: Some(0.2),
+                    e: Some(1.0),
+                    f: Some(3000.0),
+                },
+                2,
+            ),
+            spanned(
+                GCodeCommand::LinearMove {
+                    x: Some(20.0),
+                    y: None,
+                    z: Some(0.4),
+                    e: Some(2.0),
+                    f: None,
+                },
+                3,
+            ),
+        ];
+        let result = insert_progress_markers(cmds, 60.0, 2, &progress_config());
+        let m73s: Vec<_> = result
+            .commands
+            .iter()
+            .filter(|c| {
+                matches!(
+                    &c.inner,
+                    GCodeCommand::MetaCommand { code: 73, .. }
+                )
+            })
+            .collect();
+        assert!(
+            m73s.len() >= 1,
+            "should insert M73 at Z-based layer boundaries"
         );
     }
 }
