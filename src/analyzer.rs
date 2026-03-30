@@ -36,6 +36,12 @@ pub struct AnalysisResult {
 /// Mutable simulation state threaded through the analyser.
 ///
 /// This is an internal implementation detail; callers only see [`AnalysisResult`].
+///
+/// The struct has four independent boolean flags (`is_absolute`, `e_absolute`,
+/// `has_layer_change_comments`, `has_temp_tower_comment`), each representing
+/// a genuinely orthogonal binary property of the simulation state.  A state
+/// machine would add indirection without clarity gain here.
+#[allow(clippy::struct_excessive_bools)]
 struct PrinterState {
     /// Current tool position in absolute machine coordinates (mm).
     pos: Point3D,
@@ -69,6 +75,17 @@ struct PrinterState {
     /// boundary is committed (comment path → directly to `PrintStats`; Z path
     /// → to `z_layer_times`).
     current_layer_time: f64,
+    /// Temperature changes recorded during the print: `(temperature_c, z_mm)`.
+    ///
+    /// Populated by M104/M109 commands.  Used at finalisation to detect
+    /// temperature tower patterns.
+    temp_changes: Vec<(f64, f64)>,
+    /// Most recent hotend temperature set via M104/M109.  Used to suppress
+    /// duplicate entries when the same temperature is commanded twice.
+    last_hotend_temp: Option<f64>,
+    /// Set to `true` when a comment containing "temperature tower" or "temp tower"
+    /// is encountered.  Triggers I003 without requiring a pattern analysis.
+    has_temp_tower_comment: bool,
 }
 
 impl Default for PrinterState {
@@ -84,6 +101,9 @@ impl Default for PrinterState {
             z_layer_count: 0,
             z_layer_times: Vec::new(),
             current_layer_time: 0.0,
+            temp_changes: Vec::new(),
+            last_hotend_temp: None,
+            has_temp_tower_comment: false,
         }
     }
 }
@@ -187,6 +207,24 @@ pub fn analyze<'a>(
         print_stats.per_layer_times = printer.z_layer_times;
     }
 
+    // Temperature tower detection: comment keyword takes priority; fall back to
+    // staircase pattern analysis on M104/M109 records.
+    if printer.has_temp_tower_comment {
+        diags.push(Diagnostic {
+            severity: Severity::Info,
+            line: 0,
+            code: "I003",
+            message: "probable temperature tower detected (keyword in comments)".to_owned(),
+        });
+    } else if let Some(step_table) = detect_temp_tower_pattern(&printer.temp_changes) {
+        diags.push(Diagnostic {
+            severity: Severity::Info,
+            line: 0,
+            code: "I003",
+            message: format!("probable temperature tower detected: {step_table}"),
+        });
+    }
+
     AnalysisResult {
         diagnostics: diags,
         stats: print_stats,
@@ -238,7 +276,27 @@ fn process_command<'a>(
         GCodeCommand::Comment { text } => {
             handle_comment(text, outputs.printer, outputs.print_stats);
         }
-        // GCommand, MetaCommand, Unknown: no motion semantics — skip.
+        // M104 / M109 — hotend temperature set/wait.  Track for temperature
+        // tower pattern detection; all other M-codes have no motion semantics.
+        GCodeCommand::MetaCommand {
+            code: 104 | 109,
+            params,
+        } => {
+            if let Some(temp) = parse_s_param(params.as_ref()) {
+                if outputs
+                    .printer
+                    .last_hotend_temp
+                    .map_or(true, |prev| (prev - temp).abs() > 0.1)
+                {
+                    outputs
+                        .printer
+                        .temp_changes
+                        .push((temp, outputs.printer.pos.z));
+                    outputs.printer.last_hotend_temp = Some(temp);
+                }
+            }
+        }
+        // GCommand, remaining MetaCommands, Unknown: no motion semantics — skip.
         GCodeCommand::GCommand { .. }
         | GCodeCommand::MetaCommand { .. }
         | GCodeCommand::Unknown { .. } => {}
@@ -414,6 +472,14 @@ fn handle_comment<S: AsRef<str>>(
         }
         printer.current_layer_time = 0.0;
     }
+
+    // Detect temperature tower keyword in comment text.  We intentionally
+    // require "temperature tower" or "temp tower" — bare "calibration" is far
+    // too broad and would fire on every flow/retraction calibration print.
+    let lower = text.as_ref().to_ascii_lowercase();
+    if lower.contains("temperature tower") || lower.contains("temp tower") {
+        printer.has_temp_tower_comment = true;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -569,6 +635,83 @@ fn emit_retraction_diagnostic(line: u32, e_delta: f64, diags: &mut Vec<Diagnosti
         code: "W002",
         message: format!("extruder retraction: E delta {e_delta:.3} mm"),
     });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Temperature tower helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parse the `S` (or `s`) parameter value from a whitespace-separated param string.
+///
+/// Returns the first successfully parsed `S` value, or `None` if no such token exists.
+fn parse_s_param(params: &str) -> Option<f64> {
+    for token in params.split_whitespace() {
+        if let Some(val_str) = token.strip_prefix('S').or_else(|| token.strip_prefix('s')) {
+            return val_str.parse().ok();
+        }
+    }
+    None
+}
+
+/// Analyse a sequence of `(temperature, z)` change records to determine whether
+/// they represent a temperature tower.
+///
+/// A temperature tower is characterised by:
+/// * At least 3 distinct temperature changes.
+/// * Z intervals between successive changes that are approximately uniform
+///   (each within ±20 % of the median interval).
+/// * Temperatures that are monotonically increasing **or** decreasing throughout.
+///
+/// Returns a human-readable step table string on detection, or `None` otherwise.
+fn detect_temp_tower_pattern(changes: &[(f64, f64)]) -> Option<String> {
+    if changes.len() < 3 {
+        return None;
+    }
+
+    let mut z_intervals: Vec<f64> = changes
+        .windows(2)
+        .map(|w| (w[1].1 - w[0].1).abs())
+        .collect();
+
+    // Discard zero-height intervals — these occur when temperature is set
+    // before the first Z move and should not disqualify the pattern.
+    z_intervals.retain(|&z| z > 0.1);
+    if z_intervals.len() < 2 {
+        return None;
+    }
+
+    // Use the median as the reference interval so a single outlier does not
+    // disqualify a genuine tower.
+    let mut sorted = z_intervals.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = sorted[sorted.len() / 2];
+
+    if median < 0.1 {
+        return None;
+    }
+
+    // All non-trivial intervals must be within ±20 % of the median.
+    let regular = z_intervals
+        .iter()
+        .all(|&z| (0.8..=1.2).contains(&(z / median)));
+
+    if !regular {
+        return None;
+    }
+
+    // Temperatures must be monotonically non-decreasing or non-increasing.
+    let temps: Vec<f64> = changes.iter().map(|(t, _)| *t).collect();
+    let increasing = temps.windows(2).all(|w| w[1] >= w[0]);
+    let decreasing = temps.windows(2).all(|w| w[1] <= w[0]);
+    if !increasing && !decreasing {
+        return None;
+    }
+
+    let steps: Vec<String> = changes
+        .iter()
+        .map(|(temp, z)| format!("{temp:.0}C@Z{z:.1}"))
+        .collect();
+    Some(steps.join(", "))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -994,6 +1137,175 @@ mod tests {
             (result.stats.total_filament_mm - 10.0).abs() < 1e-9,
             "expected 10.0, got {}",
             result.stats.total_filament_mm
+        );
+    }
+
+    // ── Temperature tower detection ──────────────────────────────────────────
+
+    #[test]
+    fn test_temp_tower_detected_synthetic() {
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(
+                linear(Some(10.0), None, Some(5.0), Some(1.0), Some(3000.0)),
+                2,
+            ),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S200"),
+                },
+                3,
+            ),
+            sp(linear(Some(20.0), None, Some(10.0), Some(2.0), None), 4),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S205"),
+                },
+                5,
+            ),
+            sp(linear(Some(30.0), None, Some(15.0), Some(3.0), None), 6),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S210"),
+                },
+                7,
+            ),
+            sp(linear(Some(40.0), None, Some(20.0), Some(4.0), None), 8),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S215"),
+                },
+                9,
+            ),
+            sp(linear(Some(50.0), None, Some(25.0), Some(5.0), None), 10),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S220"),
+                },
+                11,
+            ),
+        ];
+        let result = analyze(cmds.iter(), None);
+        let i003: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "I003")
+            .collect();
+        assert_eq!(i003.len(), 1, "should detect temperature tower");
+        assert!(i003[0].message.contains("temperature tower"));
+    }
+
+    #[test]
+    fn test_temp_tower_not_detected_normal_print() {
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S200"),
+                },
+                2,
+            ),
+            sp(
+                linear(Some(10.0), None, Some(0.2), Some(1.0), Some(3000.0)),
+                3,
+            ),
+            sp(linear(Some(20.0), None, Some(0.4), Some(2.0), None), 4),
+        ];
+        let result = analyze(cmds.iter(), None);
+        let i003: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "I003")
+            .collect();
+        assert!(i003.is_empty(), "normal print should not trigger I003");
+    }
+
+    #[test]
+    fn test_temp_tower_fewer_than_three_changes() {
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(
+                linear(Some(10.0), None, Some(5.0), Some(1.0), Some(3000.0)),
+                2,
+            ),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S200"),
+                },
+                3,
+            ),
+            sp(linear(Some(20.0), None, Some(10.0), Some(2.0), None), 4),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S210"),
+                },
+                5,
+            ),
+        ];
+        let result = analyze(cmds.iter(), None);
+        let i003: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "I003")
+            .collect();
+        assert!(
+            i003.is_empty(),
+            "fewer than 3 changes should not trigger I003"
+        );
+    }
+
+    #[test]
+    fn test_temp_tower_comment_detection() {
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(
+                GCodeCommand::Comment {
+                    text: Cow::Borrowed("Temperature Tower test"),
+                },
+                2,
+            ),
+        ];
+        let result = analyze(cmds.iter(), None);
+        let i003: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "I003")
+            .collect();
+        assert_eq!(
+            i003.len(),
+            1,
+            "comment with 'temperature tower' should emit I003"
+        );
+    }
+
+    #[test]
+    fn test_temp_tower_bare_calibration_no_trigger() {
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(
+                GCodeCommand::Comment {
+                    text: Cow::Borrowed("Flow calibration complete"),
+                },
+                2,
+            ),
+        ];
+        let result = analyze(cmds.iter(), None);
+        let i003: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "I003")
+            .collect();
+        assert!(
+            i003.is_empty(),
+            "bare 'calibration' should not trigger I003"
         );
     }
 }

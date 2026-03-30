@@ -292,6 +292,24 @@ fn per_layer_times_match_layer_count_malm() {
     );
 }
 
+// ── Temperature tower guard ──────────────────────────────────────────────────
+
+#[test]
+fn no_temp_tower_in_malm_slide() {
+    let text = fs::read_to_string(fixture("malm_slide.gcode")).expect("fixture must exist");
+    let cmds = parse_all(&text).expect("must parse");
+    let result = analyze(cmds.iter(), None);
+    let i003: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "I003")
+        .collect();
+    assert!(
+        i003.is_empty(),
+        "malm_slide is not a temp tower — I003 should not fire"
+    );
+}
+
 // ── Post-optimization re-analysis ────────────────────────────────────────────
 
 #[test]
