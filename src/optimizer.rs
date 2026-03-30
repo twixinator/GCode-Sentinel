@@ -636,7 +636,8 @@ pub fn insert_progress_markers<'a>(
     // We build the output by appending commands one at a time and inserting a
     // synthetic M73 after the triggering command whenever a boundary fires.
 
-    let mut output: Vec<Spanned<GCodeCommand<'a>>> = Vec::with_capacity(stripped.len() + effective_layer_count as usize);
+    let mut output: Vec<Spanned<GCodeCommand<'a>>> =
+        Vec::with_capacity(stripped.len() + effective_layer_count as usize);
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
 
     let mut layers_seen: u32 = 0;
@@ -2075,12 +2076,7 @@ mod tests {
         let m73s: Vec<_> = result
             .commands
             .iter()
-            .filter(|c| {
-                matches!(
-                    &c.inner,
-                    GCodeCommand::MetaCommand { code: 73, .. }
-                )
-            })
+            .filter(|c| matches!(&c.inner, GCodeCommand::MetaCommand { code: 73, .. }))
             .collect();
         assert!(
             m73s.len() >= 2,
@@ -2225,12 +2221,7 @@ mod tests {
         let m73s: Vec<_> = result
             .commands
             .iter()
-            .filter(|c| {
-                matches!(
-                    &c.inner,
-                    GCodeCommand::MetaCommand { code: 73, .. }
-                )
-            })
+            .filter(|c| matches!(&c.inner, GCodeCommand::MetaCommand { code: 73, .. }))
             .collect();
         assert!(
             m73s.len() >= 1,

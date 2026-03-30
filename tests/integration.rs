@@ -10,7 +10,7 @@ use gcode_sentinel::analyzer::analyze;
 use gcode_sentinel::diagnostics::{AnalysisReport, Severity, ValidationDiff};
 use gcode_sentinel::emitter::{emit, EmitConfig};
 use gcode_sentinel::models::MachineLimits;
-use gcode_sentinel::optimizer::{insert_progress_markers, optimize, OptConfig};
+use gcode_sentinel::optimizer::{insert_progress_markers, merge_collinear, optimize, OptConfig};
 use gcode_sentinel::parser::parse_all;
 
 fn fixture(name: &str) -> PathBuf {
@@ -373,6 +373,106 @@ fn post_opt_reanalysis_no_regression() {
             "{name}: optimizer introduced {} new error(s): {:?}",
             diff.new_errors.len(),
             diff.new_errors
+        );
+    }
+}
+
+// ── Full v2.1 pipeline ──────────────────────────────────────────────────────
+
+#[test]
+fn full_v21_pipeline_malm_slide() {
+    let text = fs::read_to_string(fixture("malm_slide.gcode")).expect("fixture must exist");
+    let cmds = parse_all(&text).expect("must parse");
+    let pre = analyze(cmds.iter(), None);
+
+    let config = OptConfig {
+        dry_run: false,
+        merge_collinear: true,
+        insert_progress: true,
+    };
+
+    let merged = merge_collinear(cmds, &config);
+    let optimized = optimize(merged.commands, &config);
+    let progress = insert_progress_markers(
+        optimized.commands,
+        pre.stats.estimated_time_seconds,
+        pre.stats.layer_count,
+        &config,
+    );
+
+    let post = analyze(progress.commands.iter(), None);
+    let diff = ValidationDiff::compute(&pre.diagnostics, &post.diagnostics);
+
+    assert!(
+        !diff.regression_detected,
+        "full v2.1 pipeline must not introduce regressions"
+    );
+
+    // Collinear merge consolidates E values across merged moves, which can
+    // accumulate floating-point rounding error.  0.1mm tolerance is well
+    // within acceptable limits for FDM printing (~0.001% relative error).
+    assert!(
+        (pre.stats.total_filament_mm - post.stats.total_filament_mm).abs() < 0.1,
+        "extrusion must be preserved within tolerance: pre={} post={}",
+        pre.stats.total_filament_mm,
+        post.stats.total_filament_mm,
+    );
+}
+
+#[test]
+fn full_v21_pipeline_rose() {
+    let text = fs::read_to_string(fixture("rose.gcode")).expect("fixture must exist");
+    let cmds = parse_all(&text).expect("must parse");
+    let pre = analyze(cmds.iter(), None);
+
+    let config = OptConfig {
+        dry_run: false,
+        merge_collinear: true,
+        insert_progress: true,
+    };
+
+    let merged = merge_collinear(cmds, &config);
+    let optimized = optimize(merged.commands, &config);
+    let progress = insert_progress_markers(
+        optimized.commands,
+        pre.stats.estimated_time_seconds,
+        pre.stats.layer_count,
+        &config,
+    );
+
+    let post = analyze(progress.commands.iter(), None);
+    let diff = ValidationDiff::compute(&pre.diagnostics, &post.diagnostics);
+
+    assert!(!diff.regression_detected);
+    // Collinear merge consolidates E values across merged moves, which can
+    // accumulate floating-point rounding error.  0.1mm tolerance is well
+    // within acceptable limits for FDM printing (~0.001% relative error).
+    assert!(
+        (pre.stats.total_filament_mm - post.stats.total_filament_mm).abs() < 0.1,
+        "extrusion must be preserved within tolerance: pre={} post={}",
+        pre.stats.total_filament_mm,
+        post.stats.total_filament_mm,
+    );
+}
+
+#[test]
+fn feedrate_stripping_preserves_analysis() {
+    for name in &["malm_slide.gcode", "rose.gcode"] {
+        let text = fs::read_to_string(fixture(name))
+            .unwrap_or_else(|_| panic!("fixture {name} must exist"));
+        let cmds = parse_all(&text).unwrap_or_else(|_| panic!("{name} must parse"));
+
+        let pre = analyze(cmds.iter(), None);
+        let opt = optimize(cmds, &OptConfig::default());
+        let post = analyze(opt.commands.iter(), None);
+
+        assert!(
+            (pre.stats.total_filament_mm - post.stats.total_filament_mm).abs() < 1e-6,
+            "{name}: feedrate stripping must preserve filament total"
+        );
+        assert_eq!(
+            pre.stats.layer_count, post.stats.layer_count,
+            "{name}: feedrate stripping must preserve layer count"
         );
     }
 }

@@ -39,13 +39,29 @@ fn main() -> Result<()> {
         cli.check_only || (cli.report_format == ReportFormat::Json && cli.report_file.is_none());
     let opt_config = OptConfig {
         dry_run: effective_dry_run,
-        ..Default::default()
+        merge_collinear: cli.merge_collinear,
+        insert_progress: cli.insert_progress,
     };
-    let opt_result = optimize(commands, &opt_config);
-    log_optimization(opt_result.changes.len(), effective_dry_run);
 
-    // Re-analyze the (possibly reduced) command list to detect regressions.
-    let post_analysis = analyze(opt_result.commands.iter(), limits.as_ref());
+    // Pre-pass: collinear merge (opt-in).
+    let merge_result = gcode_sentinel::optimizer::merge_collinear(commands, &opt_config);
+    let mut all_changes = merge_result.changes;
+
+    // Main optimizer pass.
+    let opt_result = optimize(merge_result.commands, &opt_config);
+    all_changes.extend(opt_result.changes);
+    log_optimization(all_changes.len(), effective_dry_run);
+
+    // Post-pass: M73 progress markers (opt-in).
+    let progress_result = gcode_sentinel::optimizer::insert_progress_markers(
+        opt_result.commands,
+        pre_analysis.stats.estimated_time_seconds,
+        pre_analysis.stats.layer_count,
+        &opt_config,
+    );
+
+    // Re-analyze the final command list to detect regressions.
+    let post_analysis = analyze(progress_result.commands.iter(), limits.as_ref());
     let diff = ValidationDiff::compute(&pre_analysis.diagnostics, &post_analysis.diagnostics);
     if diff.regression_detected {
         for e in &diff.new_errors {
@@ -62,7 +78,30 @@ fn main() -> Result<()> {
         );
     }
 
-    let report = build_report(post_analysis, opt_result.changes, effective_dry_run);
+    let mut report = build_report(post_analysis, all_changes, effective_dry_run);
+
+    // Add progress insertion diagnostics.
+    report.diagnostics.extend(progress_result.diagnostics);
+
+    // Minimum layer time advisory (W003).
+    if let Some(threshold) = cli.min_layer_time {
+        for (i, &layer_time) in report.stats.per_layer_times.iter().enumerate() {
+            if layer_time < threshold {
+                report
+                    .diagnostics
+                    .push(gcode_sentinel::diagnostics::Diagnostic {
+                        severity: Severity::Warning,
+                        line: 0,
+                        code: "W003",
+                        message: format!(
+                            "layer {} print time {layer_time:.1}s is below minimum {threshold}s",
+                            i + 1,
+                        ),
+                    });
+            }
+        }
+    }
+
     print_report(&report)?;
     write_report_file(&cli, &report)?;
 
@@ -82,7 +121,7 @@ fn main() -> Result<()> {
     }
 
     if !effective_dry_run {
-        write_output(&cli, &opt_result.commands)?;
+        write_output(&cli, &progress_result.commands)?;
     }
 
     Ok(())
