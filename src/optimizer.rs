@@ -276,6 +276,19 @@ pub fn merge_collinear<'a>(
         };
     }
 
+    // Collinear merge is only safe in absolute positioning mode.
+    // In relative mode, coordinates are deltas — merging by taking the last
+    // command's values would discard intermediate movement and extrusion.
+    let has_relative = commands
+        .iter()
+        .any(|c| matches!(c.inner, GCodeCommand::SetRelative));
+    if has_relative {
+        return OptimizationResult {
+            commands,
+            changes: Vec::new(),
+        };
+    }
+
     // Identify mergeable runs (each run is a Vec of indices, length >= 3).
     let runs = find_collinear_runs(&commands);
 
@@ -2023,6 +2036,23 @@ mod tests {
             !result.changes.is_empty(),
             "dry-run must still report changes"
         );
+    }
+
+    #[test]
+    fn test_rule6_skipped_in_relative_mode() {
+        let cmds = vec![
+            spanned(GCodeCommand::SetRelative, 1),
+            spanned(g1_xye(1.0, 1.0, 1.0), 2),
+            spanned(g1_xye(1.0, 1.0, 1.0), 3),
+            spanned(g1_xye(1.0, 1.0, 1.0), 4),
+        ];
+        let result = merge_collinear(cmds, &merge_config());
+        assert_eq!(
+            result.commands.len(),
+            4,
+            "collinear merge must be skipped in relative mode"
+        );
+        assert!(result.changes.is_empty());
     }
 
     // ── M73 progress marker insertion ────────────────────────────────────────
