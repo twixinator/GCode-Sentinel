@@ -2100,6 +2100,83 @@ mod tests {
         );
     }
 
+    /// Verify that a pre-existing arc move (`G2`/`ArcMoveCW`) correctly updates
+    /// `cur_x` and `cur_y` so that subsequent G1 moves which omit explicit X/Y
+    /// coordinates compute the right absolute position, enabling arc fitting.
+    ///
+    /// # Setup
+    ///
+    /// 1. `ArcMoveCW` ending at (10, 0) — this is a G2 command already in the
+    ///    input; the fitter must update `cur_x=10`, `cur_y=0` after it.
+    /// 2. Four G1 moves forming a CCW quarter-circle from (10, 0) to (0, 10),
+    ///    centred at (0, 0), radius 10.
+    ///
+    /// # Failure mode without the fix
+    ///
+    /// `resolve_x_from_cmd` / `resolve_y_from_cmd` only handle `RapidMove`, so
+    /// after the ArcMoveCW the fitter leaves `cur_x=0, cur_y=0`.  The G1 moves
+    /// are treated as starting from (0, 0) instead of (10, 0), producing circle
+    /// points that are not on any single circle → arc fit fails → no arc in
+    /// output.
+    ///
+    /// # Passing condition with the fix
+    ///
+    /// `cur_x=10, cur_y=0` after the ArcMoveCW; the G1 start point is (10, 0);
+    /// all five points lie on the circle r=10 centred at (0, 0) → arc is fitted
+    /// → output contains at least one `ArcMoveCW` or `ArcMoveCCW`.
+    #[test]
+    fn test_fit_arcs_existing_arc_in_input_position_tracked_for_following_fit() {
+        // Quarter-circle CCW from (10, 0) to (0, 10) on r=10 centred at (0,0).
+        let pts = arc_points(0.0, 0.0, 10.0, 0.0, FRAC_PI_2, 5);
+        // pts[0] == (10.0, 0.0) — the end point of the pre-existing ArcMoveCW.
+
+        let mut cmds: Vec<Spanned<GCodeCommand<'static>>> = Vec::new();
+
+        // Pre-existing G2 arc that ends at (10, 0).
+        // I = cx - start_x, J = cy - start_y.  The arc comes from some prior
+        // position; we don't care about its geometric validity for this test —
+        // what matters is that the fitter reads its endpoint (x=10, y=0) into
+        // cur_x/cur_y.
+        cmds.push(sp(
+            GCodeCommand::ArcMoveCW {
+                x: Some(10.0),
+                y: Some(0.0),
+                z: None,
+                e: Some(1.0),
+                f: Some(1500.0),
+                i: Some(-5.0),
+                j: Some(0.0),
+            },
+            1,
+        ));
+
+        // Four G1 moves along the CCW arc starting from (10, 0).
+        // arc_g1_cmds skips pts[0] (the start position), so this produces moves
+        // for pts[1]..pts[4].  The fitter must treat (10, 0) as the previous
+        // position for the first G1 to compute correct I/J offsets.
+        let arc_cmds = arc_g1_cmds(&pts, 3000.0, 0.05, 1.0);
+        cmds.extend(arc_cmds);
+
+        let result = fit_arcs(cmds, &enabled_config());
+
+        // With the fix, cur_x/cur_y are correctly set to (10, 0) after the
+        // ArcMoveCW, so the subsequent G1s form a valid arc and are fitted.
+        let has_arc = result.commands.iter().any(|c| {
+            matches!(
+                c.inner,
+                GCodeCommand::ArcMoveCW { .. } | GCodeCommand::ArcMoveCCW { .. }
+            )
+        });
+        assert!(
+            has_arc,
+            "G1 arc following a pre-existing ArcMoveCW must be fitted when position is tracked"
+        );
+        assert!(
+            !result.changes.is_empty(),
+            "at least one arc synthesis change must be recorded"
+        );
+    }
+
     #[test]
     fn test_arc_fit_no_w004_for_known_supported_firmware() {
         use std::borrow::Cow;
