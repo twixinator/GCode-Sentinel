@@ -1276,6 +1276,17 @@ impl PassState {
                 self.last_m190_params = Some(params.as_ref().to_owned());
             }
 
+            GCodeCommand::ArcMoveCW { x, y, z, e, f, .. }
+            | GCodeCommand::ArcMoveCCW { x, y, z, e, f, .. } => {
+                self.apply_move(MoveAxes {
+                    x_pos: *x,
+                    y_pos: *y,
+                    z_pos: *z,
+                    extrude: *e,
+                    feed: *f,
+                });
+            }
+
             // Comments, Unknown, GCommand, and all other MetaCommands do not
             // affect mode or position state.
             _ => {}
@@ -1284,7 +1295,9 @@ impl PassState {
         // Track modal feedrate for Rule 8.
         match cmd {
             GCodeCommand::RapidMove { f: Some(val), .. }
-            | GCodeCommand::LinearMove { f: Some(val), .. } => {
+            | GCodeCommand::LinearMove { f: Some(val), .. }
+            | GCodeCommand::ArcMoveCW { f: Some(val), .. }
+            | GCodeCommand::ArcMoveCCW { f: Some(val), .. } => {
                 self.modal_feedrate = Some(*val);
             }
             _ => {}
