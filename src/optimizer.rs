@@ -1247,7 +1247,9 @@ impl PassState {
                     feed: *f,
                 });
             }
-            GCodeCommand::LinearMove { x, y, z, e, f } => {
+            GCodeCommand::LinearMove { x, y, z, e, f }
+            | GCodeCommand::ArcMoveCW { x, y, z, e, f, .. }
+            | GCodeCommand::ArcMoveCCW { x, y, z, e, f, .. } => {
                 self.apply_move(MoveAxes {
                     x_pos: *x,
                     y_pos: *y,
@@ -1276,17 +1278,6 @@ impl PassState {
                 self.last_m190_params = Some(params.as_ref().to_owned());
             }
 
-            GCodeCommand::ArcMoveCW { x, y, z, e, f, .. }
-            | GCodeCommand::ArcMoveCCW { x, y, z, e, f, .. } => {
-                self.apply_move(MoveAxes {
-                    x_pos: *x,
-                    y_pos: *y,
-                    z_pos: *z,
-                    extrude: *e,
-                    feed: *f,
-                });
-            }
-
             // Comments, Unknown, GCommand, and all other MetaCommands do not
             // affect mode or position state.
             _ => {}
@@ -1304,7 +1295,7 @@ impl PassState {
         }
     }
 
-    /// Apply a G0/G1 move to the tracked position.
+    /// Apply a linear or arc move to the tracked position.
     fn apply_move(&mut self, axes: MoveAxes) {
         if self.pos.is_absolute {
             if let Some(v) = axes.x_pos {
@@ -2468,10 +2459,7 @@ mod tests {
             .find(|c| matches!(&c.inner, GCodeCommand::LinearMove { .. }))
             .expect("LinearMove must survive in the output");
         assert!(
-            matches!(
-                &linear.inner,
-                GCodeCommand::LinearMove { f: None, .. }
-            ),
+            matches!(&linear.inner, GCodeCommand::LinearMove { f: None, .. }),
             "LinearMove feedrate must be stripped to None by Rule 8"
         );
     }
