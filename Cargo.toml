@@ -1,6 +1,6 @@
 [package]
 name = "gcode-sentinel"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.75"
 description = "High-performance CLI tool for 3D print G-Code validation and optimization"
