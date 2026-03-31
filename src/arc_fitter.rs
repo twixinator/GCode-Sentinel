@@ -418,8 +418,12 @@ fn flush_candidate<'a>(
     candidate.clear();
 }
 
-/// Update the current X position from a non-`LinearMove` command if it carries
-/// explicit coordinates (e.g. `RapidMove`, arc moves, or `SetPosition`).
+/// Returns the X coordinate from `cmd` if it carries one, otherwise returns `current`.
+///
+/// Handles: [`GCodeCommand::RapidMove`], [`GCodeCommand::ArcMoveCW`],
+/// [`GCodeCommand::ArcMoveCCW`], and [`GCodeCommand::SetPosition`].
+/// All other variants (including [`GCodeCommand::LinearMove`]) return `current` unchanged —
+/// callers must handle `LinearMove` X resolution separately (see the main scan loop).
 fn resolve_x_from_cmd(cmd: &GCodeCommand<'_>, current: f64) -> f64 {
     match cmd {
         GCodeCommand::RapidMove { x: Some(v), .. }
@@ -430,8 +434,12 @@ fn resolve_x_from_cmd(cmd: &GCodeCommand<'_>, current: f64) -> f64 {
     }
 }
 
-/// Update the current Y position from a non-`LinearMove` command if it carries
-/// explicit coordinates (e.g. `RapidMove`, arc moves, or `SetPosition`).
+/// Returns the Y coordinate from `cmd` if it carries one, otherwise returns `current`.
+///
+/// Handles: [`GCodeCommand::RapidMove`], [`GCodeCommand::ArcMoveCW`],
+/// [`GCodeCommand::ArcMoveCCW`], and [`GCodeCommand::SetPosition`].
+/// All other variants (including [`GCodeCommand::LinearMove`]) return `current` unchanged —
+/// callers must handle `LinearMove` Y resolution separately (see the main scan loop).
 fn resolve_y_from_cmd(cmd: &GCodeCommand<'_>, current: f64) -> f64 {
     match cmd {
         GCodeCommand::RapidMove { y: Some(v), .. }
@@ -1984,57 +1992,11 @@ mod tests {
     /// values consistent with a fresh extruder baseline of 0.0 throughout.
     #[test]
     fn test_fit_arcs_g92_e_reset_mid_sequence_arc_still_fitted() {
-        // CCW quarter-circle on radius=10, centre=(0,0).
-        // Points (in logical/post-G92 space): (10,0), (0,5), (−5,8.66), (−10,0).
-        // We verify all lie on r=10: sqrt(0²+5²)=10? No — (0,5) has r=5.
-        //
-        // Correct set on r=10: (10,0), (5*sqrt(3), 5), (0,10) etc.
-        // Use the same arc_points helper: 0° → 90° with 4 samples.
-        // In logical (post-G92) space start = (10, 0), so G92 X10 Y0 is a
-        // no-op.  Instead, shift: head is at (20, 0) physically, G92 X10 Y0
-        // resets logical origin so logical position = (10, 0).  Arc moves use
-        // explicit XY so cur_x/cur_y don't affect abs_x/abs_y resolution.
-        //
-        // To get a genuine cur_x failure we need a G1 that omits X.
-        // Use: centre=(0,0), r=10.  Head at (10,0) logically after G92 X10 Y0.
-        // Arc: (10,0) → (0,10) CCW.  First G1: G1 Y0 E... (X=10 implicit).
-        // That's a degenerate case.
-        //
-        // Simpler: Use arc_points from 0°→90° on r=10, centre (0,0).
-        // Physical start is at (10, 0).  G92 X5 Y0 sets logical cur_x=5.
-        // G1 Y5 (X omitted) → abs_x = cur_x = 5 (fix) or 10 (no fix).
-        // Point (5,5): r=sqrt(50)≈7.07 — not on the circle of radius 10.
-        // So the fit fails even with the fix.  This approach doesn't work.
-        //
-        // The cleanest verifiable test: G92 X0 where head is at (10,0),
-        // then G1 with X omitted means "stay at X=0" (logical).
-        // Build an arc: start=(10,0), arc via (0,5), (-8.66,5), (-10,0)?
-        // That's not a valid arc without recomputing.
-        //
-        // DEFINITIVE APPROACH: Use the G92 E tracking.  Because
-        // extrusion_rate_consistent uses windows(2) and skips pt0.e_delta,
-        // a simple 3-move sequence does not expose the failure.  We use
-        // 5 moves (4 G1 arcs) to ensure pt1.e_delta is in the rate window,
-        // and set G92 E to a large value so the SECOND arc move's e_delta
-        // is also wrong if cur_e is not tracked correctly.
-        //
-        // Specifically: G92 E100.  Then arc moves E101, E102, E103, E104.
-        // With the fix: e_deltas = [1, 1, 1, 1] → consistent.
-        // Without fix: cur_e=0, so deltas = [101, 1, 1, 1].
-        //   windows(2): rates use pt1,pt2,pt3,pt4.e_delta = [1,1,1] → consistent!
-        //   The window starting at index 0 uses pt1.e_delta=1, not pt0.e_delta=101.
-        //
-        // Conclusion: extrusion_rate_consistent's use of w[1].e_delta makes
-        // pt0.e_delta unreachable in all window positions.  A RED→GREEN test
-        // requires either (a) testing with omitted-X/Y coordinates (cur_x/y path)
-        // or (b) waiting for the M2 fix (extrusion rate includes first segment).
-        //
-        // This test therefore documents the CORRECT BEHAVIOUR — it is a positive
-        // regression test.  The assertion is `changes.is_empty() == false`,
-        // meaning the arc after the G92 is fitted correctly.  It will pass with
-        // AND without the fix because the current rate check skips pt0.e_delta.
-        // The fix is still correct and prevents latent data corruption when M2
-        // is applied.  See task 3.2 (M2).
+        // Regression test: a G92 E reset before an arc sequence must not break arc fitting.
+        // With the fix, cur_e is updated to the G92 value so subsequent e_deltas are consistent.
+        // Note: extrusion_rate_consistent skips pt0.e_delta, so this test passes with or without
+        // the cur_e fix.  It will become a true RED test when task M2 is applied.  The companion
+        // test `test_fit_arcs_g92_x_reset_omitted_coord_arc_still_fitted` covers the cur_x path.
 
         let pts = arc_points(0.0, 0.0, 10.0, 0.0, FRAC_PI_2, 4);
 
@@ -2106,6 +2068,98 @@ mod tests {
         assert!(
             !result.changes.is_empty(),
             "arc after G92 E reset must be fitted"
+        );
+    }
+
+    /// Verify that `G92 X<value>` (a logical X reset) correctly updates `cur_x`
+    /// so that the arc-fitter's implicit arc-start position (`candidate[0].prev_x`)
+    /// reflects the reset value rather than the stale physical position.
+    ///
+    /// # Setup
+    ///
+    /// Arc: CCW quarter-circle from (0, 10) to (−10, 0), centre (0, 0), r=10.
+    ///
+    /// 1. `G0 X10 Y10` — physical head at (10, 10); `cur_x=10`, `cur_y=10`.
+    /// 2. `G92 X0` — logical X reset to 0; `cur_x` must become 0, `cur_y` stays 10.
+    /// 3. Three G1 moves for `pts[1..4]` with explicit X/Y.
+    ///
+    /// The circle fitter uses `candidate[0].prev_x/prev_y` as the arc start point.
+    /// That value equals `cur_x/cur_y` at the time the first G1 is pushed, so the
+    /// G92 X reset must propagate into `cur_x` before any subsequent G1.
+    ///
+    /// # Failure mode without the fix
+    ///
+    /// `cur_x` stays at 10 after `G92 X0`.  The circle fitter sees arc-start
+    /// `(10, 10)`, which lies at distance √200 ≠ 10 from the origin — inconsistent
+    /// with the remaining three points → fit fails → `result.changes` is empty (RED).
+    ///
+    /// # Passing condition with the fix
+    ///
+    /// `cur_x = 0` after `G92 X0`; arc-start = `(0, 10)`, which lies on r=10;
+    /// all four points consistent → arc fitted → `result.changes` non-empty (GREEN).
+    #[test]
+    fn test_fit_arcs_g92_x_reset_omitted_coord_arc_still_fitted() {
+        // Arc: CCW quarter-circle from (0, 10) to (−10, 0), centre (0, 0), r=10.
+        // n=4 produces 3 G1 moves — the minimum for check_arc_candidate (>= 3 points).
+        let pts = arc_points(0.0, 0.0, 10.0, FRAC_PI_2, PI, 4);
+        // pts[0] = (0, 10), pts[1] ≈ (−5, 8.66), pts[2] ≈ (−8.66, 5), pts[3] = (−10, 0).
+
+        let mut cmds: Vec<Spanned<GCodeCommand<'static>>> = Vec::new();
+
+        // G0 X10 Y10 — physical head position.
+        // cur_x=10, cur_y=10 after this move.
+        cmds.push(sp(
+            GCodeCommand::RapidMove {
+                x: Some(10.0),
+                y: Some(pts[0].1), // pts[0].1 = 10.0
+                z: None,
+                f: None,
+            },
+            1,
+        ));
+
+        // G92 X0 — logical X reset to 0.
+        // With fix:    cur_x = 0  → arc-start recorded as (0, 10) = pts[0] (on circle r=10).
+        // Without fix: cur_x = 10 → arc-start recorded as (10, 10) (off circle).
+        cmds.push(sp(
+            GCodeCommand::SetPosition {
+                x: Some(0.0),
+                y: None,
+                z: None,
+                e: None,
+            },
+            2,
+        ));
+
+        // Three G1 moves for pts[1..4] with explicit X/Y.
+        // The circle fitter includes prev_x/prev_y of candidate[0] as the arc start,
+        // so it sees (cur_x, cur_y) = (0, 10) [fix] or (10, 10) [no fix] as the start.
+        let extrusion_rate = 0.05_f64;
+        let mut e = 0.0_f64;
+        for i in 1..pts.len() {
+            let (px, py) = pts[i - 1];
+            let (x, y) = pts[i];
+            let seg_len = ((x - px).powi(2) + (y - py).powi(2)).sqrt();
+            e += seg_len * extrusion_rate;
+            cmds.push(sp(
+                GCodeCommand::LinearMove {
+                    x: Some(x),
+                    y: Some(y),
+                    z: None,
+                    e: Some(e),
+                    f: if i == 1 { Some(3000.0) } else { None },
+                },
+                (i + 2) as u32,
+            ));
+        }
+
+        let result = fit_arcs(cmds, &enabled_config());
+
+        // With the fix, cur_x=0 after G92 → arc-start (0, 10) lies on r=10 →
+        // all circle points consistent → arc fitted.
+        assert!(
+            !result.changes.is_empty(),
+            "arc after G92 X reset must be fitted when cur_x is correctly reset"
         );
     }
 
