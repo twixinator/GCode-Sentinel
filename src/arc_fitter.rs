@@ -2240,6 +2240,119 @@ mod tests {
         );
     }
 
+    // ─── I/J value and G91 guard ──────────────────────────────────────────────
+
+    #[test]
+    fn test_fit_arcs_quarter_circle_i_j_values_match_expected() {
+        // CCW quarter circle: centre (0, 0), radius 10, from 0° to 90°.
+        // Start: (10, 0)  End: (0, 10)
+        // I = centre_x - start_x = 0 - 10 = -10
+        // J = centre_y - start_y = 0 - 0  =   0
+        let pts = arc_points(0.0, 0.0, 10.0, 0.0, FRAC_PI_2, 5);
+
+        let mut cmds: Vec<Spanned<GCodeCommand<'static>>> = Vec::new();
+        cmds.push(sp(
+            GCodeCommand::RapidMove {
+                x: Some(pts[0].0),
+                y: Some(pts[0].1),
+                z: None,
+                f: None,
+            },
+            1,
+        ));
+        let arc_cmds = arc_g1_cmds(&pts, 3000.0, 0.05, 0.0);
+        // The final G1 carries the cumulative E for the whole arc sequence.
+        let expected_e = match arc_cmds.last().expect("arc_cmds must be non-empty").inner {
+            GCodeCommand::LinearMove { e: Some(e), .. } => e,
+            _ => panic!("last arc command must be a LinearMove with E"),
+        };
+        cmds.extend(arc_cmds);
+
+        let result = fit_arcs(cmds, &enabled_config());
+
+        let arc_cmd = result
+            .commands
+            .iter()
+            .find(|c| matches!(c.inner, GCodeCommand::ArcMoveCCW { .. }))
+            .expect("expected a fitted CCW arc in output");
+
+        match arc_cmd.inner {
+            GCodeCommand::ArcMoveCCW { x, y, i, j, e, .. } => {
+                let i_val = i.expect("fitted arc must have I offset");
+                let j_val = j.expect("fitted arc must have J offset");
+                let e_val = e.expect("fitted arc must have E value");
+
+                assert!(
+                    (i_val - (-10.0)).abs() < 1e-9,
+                    "I should be -10.0, got {i_val}"
+                );
+                assert!(j_val.abs() < 1e-9, "J should be 0.0, got {j_val}");
+
+                let x_val = x.expect("fitted arc must have X endpoint");
+                let y_val = y.expect("fitted arc must have Y endpoint");
+                assert!(
+                    (x_val - 0.0).abs() < 1e-9,
+                    "X endpoint should be 0.0, got {x_val}"
+                );
+                assert!(
+                    (y_val - 10.0).abs() < 1e-9,
+                    "Y endpoint should be 10.0, got {y_val}"
+                );
+
+                assert!(
+                    (e_val - expected_e).abs() < 1e-9,
+                    "arc E should equal cumulative input E {expected_e:.9}, got {e_val:.9}"
+                );
+            }
+            _ => panic!("matched command must be ArcMoveCCW"),
+        }
+    }
+
+    #[test]
+    fn test_fit_arcs_relative_mode_present_returns_no_changes() {
+        // G91 guard: when SetRelative is present the fitter must skip all
+        // fitting and return the command list verbatim with no changes.
+        let pts = arc_points(0.0, 0.0, 10.0, 0.0, FRAC_PI_2, 5);
+
+        let mut cmds: Vec<Spanned<GCodeCommand<'static>>> = Vec::new();
+        cmds.push(sp(GCodeCommand::SetRelative, 1));
+        cmds.push(sp(
+            GCodeCommand::RapidMove {
+                x: Some(pts[0].0),
+                y: Some(pts[0].1),
+                z: None,
+                f: None,
+            },
+            2,
+        ));
+        cmds.extend(arc_g1_cmds(&pts, 3000.0, 0.05, 0.0));
+
+        let input_len = cmds.len();
+        let result = fit_arcs(cmds, &enabled_config());
+
+        assert!(
+            result.changes.is_empty(),
+            "no changes expected when G91 is present, got {}",
+            result.changes.len()
+        );
+        assert_eq!(
+            result.commands.len(),
+            input_len,
+            "command count must be unchanged when G91 guard fires"
+        );
+        // Confirm no arc command was synthesised — all commands remain as G0/G1.
+        let has_arc = result.commands.iter().any(|c| {
+            matches!(
+                c.inner,
+                GCodeCommand::ArcMoveCCW { .. } | GCodeCommand::ArcMoveCW { .. }
+            )
+        });
+        assert!(
+            !has_arc,
+            "no arc commands should appear when G91 guard fires"
+        );
+    }
+
     #[test]
     fn test_arc_fit_no_w004_for_known_supported_firmware() {
         use std::borrow::Cow;
