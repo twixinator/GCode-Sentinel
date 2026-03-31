@@ -145,6 +145,22 @@ pub struct Cli {
     /// preceding them.  Has no effect when `--insert-progress` is not set.
     #[arg(long)]
     pub trust_existing_m73: bool,
+
+    /// Enable G2/G3 arc fitting optimization.
+    ///
+    /// Detects sequences of consecutive G1 moves that approximate a circular
+    /// arc and replaces them with a single G2 (clockwise) or G3 (counter-
+    /// clockwise) arc command.  Opt-in because it modifies command structure
+    /// and requires firmware support for G2/G3.
+    #[arg(long)]
+    pub arc_fit: bool,
+
+    /// Maximum radial deviation for arc fitting (mm).
+    ///
+    /// A G1 point must lie within this distance of the fitted circle to be
+    /// included in an arc.  Default: 0.02 mm.
+    #[arg(long, value_name = "MM")]
+    pub arc_tolerance: Option<f64>,
 }
 
 impl Cli {

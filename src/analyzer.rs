@@ -126,6 +126,26 @@ struct AxisParams {
     feedrate_f: Option<f64>,
 }
 
+/// Axis parameters parsed from a G2 or G3 arc command.
+struct ArcAxisParams {
+    /// Target X coordinate, if specified.
+    target_x: Option<f64>,
+    /// Target Y coordinate, if specified.
+    target_y: Option<f64>,
+    /// Target Z coordinate, if specified.
+    target_z: Option<f64>,
+    /// Extruder position/delta, if specified.
+    extruder_e: Option<f64>,
+    /// Feed rate override, if specified.
+    feedrate_f: Option<f64>,
+    /// X offset from current position to arc centre, if specified.
+    i_offset: Option<f64>,
+    /// Y offset from current position to arc centre, if specified.
+    j_offset: Option<f64>,
+    /// `true` = G2 (clockwise), `false` = G3 (counter-clockwise).
+    clockwise: bool,
+}
+
 /// Mutable output targets passed into move handlers.
 ///
 /// Bundling these reduces the argument count on internal functions.
@@ -298,6 +318,48 @@ fn process_command<'a>(
                 }
             }
         }
+        GCodeCommand::ArcMoveCW {
+            x,
+            y,
+            z,
+            e,
+            f,
+            i,
+            j,
+        } => {
+            let params = ArcAxisParams {
+                target_x: *x,
+                target_y: *y,
+                target_z: *z,
+                extruder_e: *e,
+                feedrate_f: *f,
+                i_offset: *i,
+                j_offset: *j,
+                clockwise: true,
+            };
+            handle_arc_move(spanned.line, &params, outputs, limits);
+        }
+        GCodeCommand::ArcMoveCCW {
+            x,
+            y,
+            z,
+            e,
+            f,
+            i,
+            j,
+        } => {
+            let params = ArcAxisParams {
+                target_x: *x,
+                target_y: *y,
+                target_z: *z,
+                extruder_e: *e,
+                feedrate_f: *f,
+                i_offset: *i,
+                j_offset: *j,
+                clockwise: false,
+            };
+            handle_arc_move(spanned.line, &params, outputs, limits);
+        }
         // GCommand, remaining MetaCommands, Unknown: no motion semantics — skip.
         GCodeCommand::GCommand { .. }
         | GCodeCommand::MetaCommand { .. }
@@ -416,6 +478,184 @@ fn handle_linear_move(
     }
 
     outputs.printer.pos = dest;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// G2 / G3 arc move handler
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handle a G2 (clockwise) or G3 (counter-clockwise) arc move.
+///
+/// Computes arc length from the I/J centre offsets, updates bbox by checking
+/// which cardinal-direction extrema of the arc circle fall within the swept
+/// span, and accumulates extrusion in the same way as G1.
+///
+/// When I and J are both absent (or both zero), the arc degenerates to a
+/// straight line and is treated as a zero-radius move (no distance added).
+fn handle_arc_move(
+    line: u32,
+    params: &ArcAxisParams,
+    outputs: &mut MoveOutputs<'_>,
+    limits: Option<&MachineLimits>,
+) {
+    if let Some(feed) = params.feedrate_f {
+        outputs.printer.feedrate = feed;
+    }
+
+    // Resolve absolute end position.
+    let end = if outputs.printer.is_absolute {
+        Point3D {
+            x: params.target_x.unwrap_or(outputs.printer.pos.x),
+            y: params.target_y.unwrap_or(outputs.printer.pos.y),
+            z: params.target_z.unwrap_or(outputs.printer.pos.z),
+        }
+    } else {
+        Point3D {
+            x: outputs.printer.pos.x + params.target_x.unwrap_or(0.0),
+            y: outputs.printer.pos.y + params.target_y.unwrap_or(0.0),
+            z: outputs.printer.pos.z + params.target_z.unwrap_or(0.0),
+        }
+    };
+
+    emit_negative_coord_warning(line, &end, outputs.diags);
+    if let Some(lim) = limits {
+        emit_bounds_errors(line, &end, lim, outputs.diags);
+    }
+
+    // Arc centre in absolute coordinates.
+    let i = params.i_offset.unwrap_or(0.0);
+    let j = params.j_offset.unwrap_or(0.0);
+    let cx = outputs.printer.pos.x + i;
+    let cy = outputs.printer.pos.y + j;
+
+    let radius = (i * i + j * j).sqrt();
+    let arc_length = if radius > 1e-10 {
+        // Angles of start and end points relative to centre.
+        let angle_start = (outputs.printer.pos.y - cy).atan2(outputs.printer.pos.x - cx);
+        let angle_end = (end.y - cy).atan2(end.x - cx);
+
+        // Compute the absolute sweep angle respecting direction.
+        let span = arc_span(angle_start, angle_end, params.clockwise);
+        radius * span.abs()
+    } else {
+        0.0
+    };
+
+    // Update statistics.
+    outputs.print_stats.move_count += 1;
+    outputs.print_stats.total_distance_mm += arc_length;
+    if outputs.printer.feedrate > 0.0 {
+        let time = arc_length / (outputs.printer.feedrate / 60.0);
+        outputs.print_stats.estimated_time_seconds += time;
+        outputs.printer.current_layer_time += time;
+    }
+
+    // Update bounding box: include the arc endpoint plus any cardinal extrema
+    // (N/S/E/W on the circle) that fall within the swept angle span.
+    update_bbox(&end, outputs.print_stats);
+    if radius > 1e-10 {
+        let angle_start = (outputs.printer.pos.y - cy).atan2(outputs.printer.pos.x - cx);
+        let angle_end = (end.y - cy).atan2(end.x - cx);
+        // Check each of the four cardinal angles on the circle.
+        for (angle, ex, ey) in [
+            (0.0_f64, cx + radius, cy),                      // East
+            (std::f64::consts::FRAC_PI_2, cx, cy + radius),  // North
+            (std::f64::consts::PI, cx - radius, cy),         // West
+            (-std::f64::consts::FRAC_PI_2, cx, cy - radius), // South
+        ] {
+            if angle_in_span(angle, angle_start, angle_end, params.clockwise) {
+                update_bbox(
+                    &Point3D {
+                        x: ex,
+                        y: ey,
+                        z: end.z,
+                    },
+                    outputs.print_stats,
+                );
+            }
+        }
+    }
+
+    // Extruder accounting.
+    if let Some(e_delta) = compute_e_delta(params.extruder_e, outputs.printer) {
+        emit_retraction_diagnostic(line, e_delta, outputs.diags);
+        if e_delta > 0.0 {
+            outputs.print_stats.total_filament_mm += e_delta;
+        }
+        if outputs.printer.e_absolute {
+            if let Some(raw_e) = params.extruder_e {
+                outputs.printer.extruder = raw_e;
+            }
+        } else {
+            outputs.printer.extruder += params.extruder_e.unwrap_or(0.0);
+        }
+    }
+
+    outputs.printer.pos = end;
+}
+
+/// Compute the absolute (positive) sweep radians from `start` to `end` in the
+/// given direction.  Result is in `[0, 2π]`.
+fn arc_span(start: f64, end: f64, clockwise: bool) -> f64 {
+    let two_pi = std::f64::consts::TAU;
+    let delta = if clockwise {
+        // CW: start → end by decreasing angle.
+        let d = start - end;
+        if d < 0.0 {
+            d + two_pi
+        } else {
+            d
+        }
+    } else {
+        // CCW: start → end by increasing angle.
+        let d = end - start;
+        if d < 0.0 {
+            d + two_pi
+        } else {
+            d
+        }
+    };
+    // Full-circle case: when start == end the span is 2π, not 0.
+    if delta < 1e-10 {
+        two_pi
+    } else {
+        delta
+    }
+}
+
+/// Returns `true` if `angle` lies within the arc swept from `start` to `end`
+/// in the given direction.
+fn angle_in_span(angle: f64, start: f64, end: f64, clockwise: bool) -> bool {
+    let two_pi = std::f64::consts::TAU;
+    // Normalise all angles to [0, 2π).
+    let norm = |a: f64| {
+        let r = a % two_pi;
+        if r < 0.0 {
+            r + two_pi
+        } else {
+            r
+        }
+    };
+    let s = norm(start);
+    let e = norm(end);
+    let a = norm(angle);
+    if clockwise {
+        // CW sweep: angles decrease from s to e.
+        if s >= e {
+            a <= s && a >= e
+        } else {
+            // Wraps around 0.
+            a <= s || a >= e
+        }
+    } else {
+        // CCW sweep: angles increase from s to e.
+        if e >= s {
+            a >= s && a <= e
+        } else {
+            // Wraps around 2π.
+            a >= s || a <= e
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1376,6 +1616,223 @@ mod tests {
         assert!(
             i003.is_empty(),
             "bare 'calibration' should not trigger I003"
+        );
+    }
+
+    // ── Arc move analyzer tests ───────────────────────────────────────────────
+
+    /// Helper: build an ArcMoveCW spanned command.
+    fn arc_cw(
+        x: Option<f64>,
+        y: Option<f64>,
+        z: Option<f64>,
+        e: Option<f64>,
+        f: Option<f64>,
+        i: Option<f64>,
+        j: Option<f64>,
+    ) -> GCodeCommand<'static> {
+        GCodeCommand::ArcMoveCW {
+            x,
+            y,
+            z,
+            e,
+            f,
+            i,
+            j,
+        }
+    }
+
+    /// Helper: build an ArcMoveCCW spanned command.
+    fn arc_ccw(
+        x: Option<f64>,
+        y: Option<f64>,
+        z: Option<f64>,
+        e: Option<f64>,
+        f: Option<f64>,
+        i: Option<f64>,
+        j: Option<f64>,
+    ) -> GCodeCommand<'static> {
+        GCodeCommand::ArcMoveCCW {
+            x,
+            y,
+            z,
+            e,
+            f,
+            i,
+            j,
+        }
+    }
+
+    #[test]
+    fn test_analyze_arc_move_cw_updates_position_to_endpoint() {
+        // Start at (0,0), CW quarter arc to (10,10), centre at (10,0).
+        // I = 10, J = 0.
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(
+                arc_cw(
+                    Some(10.0),
+                    Some(10.0),
+                    Some(0.2),
+                    None,
+                    Some(3000.0),
+                    Some(10.0),
+                    Some(0.0),
+                ),
+                2,
+            ),
+            // Next move should start from the arc endpoint (10, 10, 0.2).
+            sp(
+                linear(Some(20.0), Some(10.0), Some(0.2), Some(1.0), None),
+                3,
+            ),
+        ];
+        let result = analyze(cmds.iter(), None);
+        // Two moves: arc + linear.
+        assert_eq!(result.stats.move_count, 2);
+        // Bbox should include (10, 10) from arc endpoint and (20, 10) from linear.
+        assert!((result.stats.bbox_max.x - 20.0).abs() < 1e-9, "bbox_max.x");
+    }
+
+    #[test]
+    fn test_analyze_arc_move_accumulates_arc_length_in_total_distance() {
+        // Quarter circle: r=10, span=π/2, arc_length = 10 * π/2 ≈ 15.708.
+        // Start at (10, 0), centre at (0, 0) → I = -10, J = 0.
+        // CCW to (0, 10).
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(linear(Some(10.0), Some(0.0), None, None, Some(3000.0)), 2),
+            sp(
+                arc_ccw(
+                    Some(0.0),
+                    Some(10.0),
+                    None,
+                    None,
+                    None,
+                    Some(-10.0),
+                    Some(0.0),
+                ),
+                3,
+            ),
+        ];
+        let result = analyze(cmds.iter(), None);
+        let expected_arc = std::f64::consts::FRAC_PI_2 * 10.0; // ≈ 15.708
+                                                               // total_distance = straight move to (10,0) + arc
+        let straight = 10.0_f64;
+        let total_expected = straight + expected_arc;
+        assert!(
+            (result.stats.total_distance_mm - total_expected).abs() < 0.01,
+            "expected ~{total_expected:.3}, got {:.3}",
+            result.stats.total_distance_mm
+        );
+    }
+
+    #[test]
+    fn test_analyze_arc_bbox_includes_cardinal_extrema_within_span() {
+        // CCW arc from (10,0) to (0,10), centre (0,0), r=10.
+        // Span covers 0° to 90° CCW, so the East point (10,0) is the start,
+        // and the North point (0,10) is the end — both endpoints included.
+        // No other cardinal point (West at (-10,0), South at (0,-10)) should
+        // be in bbox_min/max x below -10 or y below -10.
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(linear(Some(10.0), Some(0.0), None, None, Some(3000.0)), 2),
+            sp(
+                arc_ccw(
+                    Some(0.0),
+                    Some(10.0),
+                    None,
+                    None,
+                    None,
+                    Some(-10.0),
+                    Some(0.0),
+                ),
+                3,
+            ),
+        ];
+        let result = analyze(cmds.iter(), None);
+        // bbox_max.x should be 10 (the East point / arc start).
+        assert!(
+            result.stats.bbox_max.x <= 10.0 + 1e-9,
+            "bbox_max.x should not exceed 10, got {}",
+            result.stats.bbox_max.x
+        );
+        // bbox_min.x should not be less than 0 (West/South not in span).
+        assert!(
+            result.stats.bbox_min.x >= -0.1,
+            "West cardinal should not be included, got bbox_min.x={}",
+            result.stats.bbox_min.x
+        );
+    }
+
+    #[test]
+    fn test_analyze_arc_bbox_excludes_cardinal_extrema_outside_span() {
+        // CW arc from (0,10) to (10,0), centre (0,0), r=10.
+        // I=0, J=-10. CW goes from 90° down to 0° — only covers first quadrant.
+        // South (-90°) and West (180°) should not appear.
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(linear(Some(0.0), Some(10.0), None, None, Some(3000.0)), 2),
+            sp(
+                arc_cw(
+                    Some(10.0),
+                    Some(0.0),
+                    None,
+                    None,
+                    None,
+                    Some(0.0),
+                    Some(-10.0),
+                ),
+                3,
+            ),
+        ];
+        let result = analyze(cmds.iter(), None);
+        // Neither x=-10 nor y=-10 should appear.
+        assert!(
+            result.stats.bbox_min.x >= -0.1,
+            "West not in span, got bbox_min.x={}",
+            result.stats.bbox_min.x
+        );
+        assert!(
+            result.stats.bbox_min.y >= -0.1,
+            "South not in span, got bbox_min.y={}",
+            result.stats.bbox_min.y
+        );
+    }
+
+    #[test]
+    fn test_analyze_arc_increments_move_count() {
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(
+                arc_cw(
+                    Some(10.0),
+                    Some(0.0),
+                    None,
+                    None,
+                    Some(3000.0),
+                    Some(5.0),
+                    Some(0.0),
+                ),
+                2,
+            ),
+            sp(
+                arc_ccw(
+                    Some(0.0),
+                    Some(10.0),
+                    None,
+                    None,
+                    None,
+                    Some(-5.0),
+                    Some(5.0),
+                ),
+                3,
+            ),
+        ];
+        let result = analyze(cmds.iter(), None);
+        assert_eq!(
+            result.stats.move_count, 2,
+            "each arc should count as one move"
         );
     }
 }

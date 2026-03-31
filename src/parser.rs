@@ -143,6 +143,10 @@ impl<'a> Iterator for StreamingParser<'a> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Parse the content of a single (already-split, `\r`-stripped) line.
+// G-code dispatch is an exhaustive match table; adding G2/G3 arms pushed it
+// just over the 100-line limit.  Extracting sub-functions would scatter the
+// one-to-one letter→variant mapping across the file without clarity gain.
+#[allow(clippy::too_many_lines)]
 fn parse_line_inner(line: &str, line_number: u32) -> Result<GCodeCommand<'_>, ParseError> {
     let trimmed = line.trim_start();
 
@@ -210,6 +214,32 @@ fn parse_line_inner(line: &str, line_number: u32) -> Result<GCodeCommand<'_>, Pa
                 z: p.z_pos,
                 e: p.extrude,
                 f: p.feed,
+            })
+        }
+        // ── G2 – Clockwise arc move ───────────────────────────────────────
+        (b'G', 2) => {
+            let p = parse_xyzef_ij(params_raw, line_number)?;
+            Ok(GCodeCommand::ArcMoveCW {
+                x: p.x_pos,
+                y: p.y_pos,
+                z: p.z_pos,
+                e: p.extrude,
+                f: p.feed,
+                i: p.i_offset,
+                j: p.j_offset,
+            })
+        }
+        // ── G3 – Counter-clockwise arc move ───────────────────────────────
+        (b'G', 3) => {
+            let p = parse_xyzef_ij(params_raw, line_number)?;
+            Ok(GCodeCommand::ArcMoveCCW {
+                x: p.x_pos,
+                y: p.y_pos,
+                z: p.z_pos,
+                e: p.extrude,
+                f: p.feed,
+                i: p.i_offset,
+                j: p.j_offset,
             })
         }
         // ── G90 – Set absolute ────────────────────────────────────────────
@@ -328,6 +358,20 @@ struct MoveParams {
     feed: Option<f64>,
 }
 
+/// Parsed axis, feed-rate, and arc-centre offset values from a G2/G3 parameter
+/// string.
+struct ArcParams {
+    x_pos: Option<f64>,
+    y_pos: Option<f64>,
+    z_pos: Option<f64>,
+    extrude: Option<f64>,
+    feed: Option<f64>,
+    /// X offset from current position to arc centre.
+    i_offset: Option<f64>,
+    /// Y offset from current position to arc centre.
+    j_offset: Option<f64>,
+}
+
 /// Parse the parameter string for G0, G1, and G92 commands.
 ///
 /// Parameters may be space-separated or packed
@@ -404,6 +448,78 @@ fn parse_xyzef(params: &str, line_number: u32) -> Result<MoveParams, ParseError>
     Ok(result)
 }
 
+/// Parse the parameter string for G2 and G3 arc commands.
+///
+/// Extends [`parse_xyzef`] with `I` and `J` arc-centre offset parameters.
+/// All parameters are optional; absent ones default to `None`.
+///
+/// # Errors
+///
+/// Returns [`ParseError::InvalidNumber`] if any parameter value string cannot
+/// be parsed as `f64`.
+fn parse_xyzef_ij(params: &str, line_number: u32) -> Result<ArcParams, ParseError> {
+    let mut result = ArcParams {
+        x_pos: None,
+        y_pos: None,
+        z_pos: None,
+        extrude: None,
+        feed: None,
+        i_offset: None,
+        j_offset: None,
+    };
+
+    let mut cursor = 0usize;
+    let bytes = params.as_bytes();
+
+    while cursor < bytes.len() {
+        if bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+            continue;
+        }
+
+        let letter = bytes[cursor];
+        if !letter.is_ascii_alphabetic() {
+            cursor += 1;
+            continue;
+        }
+        cursor += 1;
+
+        let value_start = cursor;
+        if cursor < bytes.len() && (bytes[cursor] == b'+' || bytes[cursor] == b'-') {
+            cursor += 1;
+        }
+        while cursor < bytes.len() && (bytes[cursor].is_ascii_digit() || bytes[cursor] == b'.') {
+            cursor += 1;
+        }
+        let value_str = &params[value_start..cursor];
+
+        if value_str.is_empty() || value_str == "+" || value_str == "-" {
+            continue;
+        }
+
+        let value: f64 = value_str
+            .parse()
+            .map_err(|source| ParseError::InvalidNumber {
+                line: line_number,
+                value: value_str.to_owned(),
+                source,
+            })?;
+
+        match letter.to_ascii_uppercase() {
+            b'X' => result.x_pos = Some(value),
+            b'Y' => result.y_pos = Some(value),
+            b'Z' => result.z_pos = Some(value),
+            b'E' => result.extrude = Some(value),
+            b'F' => result.feed = Some(value),
+            b'I' => result.i_offset = Some(value),
+            b'J' => result.j_offset = Some(value),
+            _ => {}
+        }
+    }
+
+    Ok(result)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -415,6 +531,76 @@ mod tests {
     /// Convenience: parse a single line at line 1, offset 0.
     fn parse(s: &str) -> Result<GCodeCommand<'_>, ParseError> {
         parse_line(s, 1, 0).map(|s| s.inner)
+    }
+
+    // ── G2 / G3 — arc moves ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_g2_cw_arc_with_ij_parses_to_arc_move_cw() {
+        let cmd = parse("G2 X20 Y0 I10 J0").unwrap();
+        assert_eq!(
+            cmd,
+            GCodeCommand::ArcMoveCW {
+                x: Some(20.0),
+                y: Some(0.0),
+                z: None,
+                e: None,
+                f: None,
+                i: Some(10.0),
+                j: Some(0.0),
+            }
+        );
+    }
+
+    #[test]
+    fn test_g3_ccw_arc_with_ij_parses_to_arc_move_ccw() {
+        let cmd = parse("G3 X0 Y10 I0 J10").unwrap();
+        assert_eq!(
+            cmd,
+            GCodeCommand::ArcMoveCCW {
+                x: Some(0.0),
+                y: Some(10.0),
+                z: None,
+                e: None,
+                f: None,
+                i: Some(0.0),
+                j: Some(10.0),
+            }
+        );
+    }
+
+    #[test]
+    fn test_g2_all_parameters_x_y_z_e_f_i_j() {
+        let cmd = parse("G2 X10 Y10 Z0.2 E1.5 F3000 I5 J0").unwrap();
+        assert_eq!(
+            cmd,
+            GCodeCommand::ArcMoveCW {
+                x: Some(10.0),
+                y: Some(10.0),
+                z: Some(0.2),
+                e: Some(1.5),
+                f: Some(3000.0),
+                i: Some(5.0),
+                j: Some(0.0),
+            }
+        );
+    }
+
+    #[test]
+    fn test_g2_missing_ij_defaults_to_none() {
+        let cmd = parse("G2 X10 Y10").unwrap();
+        assert_eq!(
+            cmd,
+            GCodeCommand::ArcMoveCW {
+                x: Some(10.0),
+                y: Some(10.0),
+                z: None,
+                e: None,
+                f: None,
+                i: None,
+                j: None,
+            }
+        );
     }
 
     // ── G0 ────────────────────────────────────────────────────────────────────
