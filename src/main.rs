@@ -41,6 +41,9 @@ fn main() -> Result<()> {
         dry_run: effective_dry_run,
         merge_collinear: cli.merge_collinear,
         insert_progress: cli.insert_progress,
+        no_travel_merge: cli.no_travel_merge,
+        no_feedrate_strip: cli.no_feedrate_strip,
+        trust_existing_m73: cli.trust_existing_m73,
     };
 
     // Pre-pass: collinear merge (opt-in).
@@ -57,6 +60,7 @@ fn main() -> Result<()> {
         opt_result.commands,
         pre_analysis.stats.estimated_time_seconds,
         pre_analysis.stats.layer_count,
+        &pre_analysis.stats.per_layer_times,
         &opt_config,
     );
 

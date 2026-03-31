@@ -14,7 +14,9 @@
 //! | 3 | Duplicate consecutive fan command — M106/M107 with same params |
 //! | 4 | Zero-delta move — absolute move to current position with no feedrate change |
 //! | 5 | Duplicate consecutive temperature command — M104/M109/M140/M190 |
+//! | 6 | Collinear move merging — three or more consecutive G1 on the same 3D line (opt-in via `--merge-collinear`) |
 //! | 7 | Consecutive same-axis travel — first non-extruding single-axis move superseded by next |
+//! | 8 | Redundant feedrate elimination — strip `F` when it matches the modal feedrate |
 //!
 //! # Dry-run mode
 //!
@@ -35,6 +37,7 @@ use crate::models::{GCodeCommand, Spanned};
 
 /// Configuration for the optimizer.
 #[derive(Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct OptConfig {
     /// When `true`, compute all changes but return the original command list
     /// unchanged.  Callers can inspect [`OptimizationResult::changes`] to
@@ -51,6 +54,28 @@ pub struct OptConfig {
     /// When `true`, strip existing M73 progress markers and re-insert
     /// recalculated ones at each layer boundary.
     pub insert_progress: bool,
+
+    /// When `true`, Rule 7 (consecutive same-axis travel merging) is disabled.
+    ///
+    /// By default Rule 7 removes an earlier single-axis non-extruding move
+    /// when the very next move on the same axis (with the same feedrate)
+    /// supersedes it.  Set this flag to keep all intermediate travel commands.
+    pub no_travel_merge: bool,
+
+    /// When `true`, Rule 8 (redundant feedrate elimination) is disabled.
+    ///
+    /// By default Rule 8 strips the `F` parameter from moves whose feedrate
+    /// already matches the current modal feedrate.  Set this flag to preserve
+    /// all feedrate annotations as-is.
+    pub no_feedrate_strip: bool,
+
+    /// When `true`, existing M73 progress markers are preserved instead of
+    /// being stripped by `--insert-progress`.
+    ///
+    /// Only inserts new M73 commands at layer boundaries that do not already
+    /// have one immediately preceding them.  Has no effect when
+    /// `insert_progress` is `false`.
+    pub trust_existing_m73: bool,
 }
 
 /// The result of a single optimization pass.
@@ -94,6 +119,14 @@ pub fn optimize<'a>(
     // marking a command redundant — the move survives but loses its `f` field.
     let mut modifications: Vec<Option<GCodeCommand<'a>>> = vec![None; commands.len()];
 
+    // Rule 7 is only safe in absolute positioning mode.
+    // In relative mode (G91), single-axis G0 moves are deltas — merging them
+    // would skip intermediate movement and produce a dimensional error.
+    let rule7_active = !config.no_travel_merge
+        && !commands
+            .iter()
+            .any(|c| matches!(c.inner, GCodeCommand::SetRelative));
+
     // ── Pass: walk commands once, maintaining state ───────────────────────────
     let mut state = PassState::new();
 
@@ -123,7 +156,7 @@ pub fn optimize<'a>(
         // prevents a move that changes axis position (but not feedrate) from
         // being incorrectly collapsed by Rule 7 just because it originally
         // carried a now-redundant F parameter.
-        if !redundant[idx] {
+        if !redundant[idx] && !config.no_feedrate_strip {
             let cmd_feed = match cmd {
                 GCodeCommand::RapidMove { f, .. } | GCodeCommand::LinearMove { f, .. } => *f,
                 _ => None,
@@ -165,40 +198,45 @@ pub fn optimize<'a>(
         // the printer will skip straight to the final position anyway.
         // Comments and Unknown commands are transparent (do not break the chain).
         //
+        // Skipped entirely when relative positioning is active anywhere in the
+        // file (A1 guard) or when disabled via `config.no_travel_merge`.
+        //
         // Use the effective command here: if Rule 8 just stripped the feedrate
         // from this move, Rule 7 must compare against the stripped version so
         // it does not incorrectly collapse moves that differ only because one
         // carries a now-removed F parameter.
-        let effective_cmd: &GCodeCommand<'_> = modifications[idx].as_ref().unwrap_or(cmd);
-        if let Some((current_axis, current_feed)) = single_axis_travel(effective_cmd) {
-            if let Some((prev_idx, ref prev_travel)) = state.last_single_axis_travel {
-                if prev_travel.axis == current_axis
-                    && prev_travel.feedrate == current_feed
-                    && !redundant[prev_idx]
-                {
-                    redundant[prev_idx] = true;
-                    changes.push(OptimizationChange {
-                        line: commands[prev_idx].line,
-                        description: "redundant same-axis travel (superseded by next move)"
-                            .to_owned(),
-                    });
+        if rule7_active {
+            let effective_cmd: &GCodeCommand<'_> = modifications[idx].as_ref().unwrap_or(cmd);
+            if let Some((current_axis, current_feed)) = single_axis_travel(effective_cmd) {
+                if let Some((prev_idx, ref prev_travel)) = state.last_single_axis_travel {
+                    if prev_travel.axis == current_axis
+                        && prev_travel.feedrate == current_feed
+                        && !redundant[prev_idx]
+                    {
+                        redundant[prev_idx] = true;
+                        changes.push(OptimizationChange {
+                            line: commands[prev_idx].line,
+                            description: "redundant same-axis travel (superseded by next move)"
+                                .to_owned(),
+                        });
+                    }
                 }
-            }
-            state.last_single_axis_travel = Some((
-                idx,
-                SingleAxisTravel {
-                    axis: current_axis,
-                    feedrate: current_feed,
-                },
-            ));
-        } else {
-            match cmd {
-                // Comments and unknown tokens are transparent — preserve the
-                // pending travel so it can still be matched by a later move.
-                GCodeCommand::Comment { .. } | GCodeCommand::Unknown { .. } => {}
-                // Any other real command breaks the detection chain.
-                _ => {
-                    state.last_single_axis_travel = None;
+                state.last_single_axis_travel = Some((
+                    idx,
+                    SingleAxisTravel {
+                        axis: current_axis,
+                        feedrate: current_feed,
+                    },
+                ));
+            } else {
+                match cmd {
+                    // Comments and unknown tokens are transparent — preserve the
+                    // pending travel so it can still be matched by a later move.
+                    GCodeCommand::Comment { .. } | GCodeCommand::Unknown { .. } => {}
+                    // Any other real command breaks the detection chain.
+                    _ => {
+                        state.last_single_axis_travel = None;
+                    }
                 }
             }
         }
@@ -512,6 +550,20 @@ fn find_collinear_runs(commands: &[Spanned<GCodeCommand<'_>>]) -> Vec<Vec<usize>
             continue;
         }
 
+        // Z presence must be consistent across the run.  Mixing explicit z
+        // values with absent z values (which default to 0.0) would corrupt the
+        // collinearity check by comparing real z positions against 0.
+        let first_has_z = matches!(
+            &commands[first_idx].inner,
+            GCodeCommand::LinearMove { z: Some(_), .. }
+        );
+        let this_has_z = matches!(&spanned.inner, GCodeCommand::LinearMove { z: Some(_), .. });
+        if first_has_z != this_has_z {
+            flush_run(&mut current_run, commands, &mut runs);
+            current_run.push(idx);
+            continue;
+        }
+
         // Collinearity: check that this point lies on the line from
         // the first point to the second point in the run (once we have >=2).
         if current_run.len() >= 2 {
@@ -616,11 +668,16 @@ pub struct ProgressInsertionResult<'a> {
 ///
 /// Does not panic under any input.
 #[must_use]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines
+)]
 pub fn insert_progress_markers<'a>(
     commands: Vec<Spanned<GCodeCommand<'a>>>,
     estimated_time_seconds: f64,
     layer_count: u32,
+    per_layer_times: &[f64],
     config: &OptConfig,
 ) -> ProgressInsertionResult<'a> {
     if !config.insert_progress {
@@ -633,11 +690,33 @@ pub fn insert_progress_markers<'a>(
     // Safety cap: never emit more markers than the known layer count.
     let effective_layer_count = layer_count.max(1);
 
+    // Build a cumulative-time prefix sum from per_layer_times so that P/R
+    // values reflect actual layer durations rather than a uniform distribution.
+    // Falls back to linear layer-count fractions when the slice is absent or
+    // its length does not match the effective layer count.
+    let cumulative_times: Option<Vec<f64>> =
+        if per_layer_times.len() as u32 == effective_layer_count {
+            let mut sums = Vec::with_capacity(per_layer_times.len() + 1);
+            sums.push(0.0_f64);
+            for &t in per_layer_times {
+                sums.push(*sums.last().expect("prefix sum is non-empty") + t);
+            }
+            Some(sums)
+        } else {
+            None
+        };
+
     // ── Phase 1: strip existing M73 commands ─────────────────────────────────
-    let stripped: Vec<Spanned<GCodeCommand<'a>>> = commands
-        .into_iter()
-        .filter(|s| !matches!(s.inner, GCodeCommand::MetaCommand { code: 73, .. }))
-        .collect();
+    // When `trust_existing_m73` is set, skip stripping so that slicer-computed
+    // M73 values (which may be more accurate than our estimates) are preserved.
+    let stripped: Vec<Spanned<GCodeCommand<'a>>> = if config.trust_existing_m73 {
+        commands
+    } else {
+        commands
+            .into_iter()
+            .filter(|s| !matches!(s.inner, GCodeCommand::MetaCommand { code: 73, .. }))
+            .collect()
+    };
 
     // ── Phase 2: walk and insert at layer boundaries ──────────────────────────
     //
@@ -717,20 +796,45 @@ pub fn insert_progress_markers<'a>(
             z_increase_boundary
         };
 
-        if should_insert && layers_seen < effective_layer_count {
+        // In trust mode, skip insertion when the immediately-preceding output
+        // command is already an M73 (slicer inserted one at this boundary).
+        let already_has_m73 = config.trust_existing_m73
+            && output.last().is_some_and(|last_cmd| {
+                matches!(last_cmd.inner, GCodeCommand::MetaCommand { code: 73, .. })
+            });
+
+        if should_insert && layers_seen < effective_layer_count && !already_has_m73 {
             layers_seen += 1;
 
-            // percent = layers_seen / layer_count * 100, capped at 100.
-            let percent = ((f64::from(layers_seen) / f64::from(effective_layer_count)) * 100.0)
-                .round()
-                .min(100.0) as u32;
-
-            // remaining_fraction is the proportion of time not yet elapsed.
-            let elapsed_fraction =
-                (f64::from(layers_seen) / f64::from(effective_layer_count)).min(1.0);
-            let remaining_fraction = (1.0 - elapsed_fraction).max(0.0);
-            let remaining_minutes =
-                ((estimated_time_seconds * remaining_fraction) / 60.0).round() as u32;
+            // Use per-layer timing data for accurate P/R values when available;
+            // otherwise fall back to a linear layer-count fraction.
+            let (percent, remaining_minutes) = if let Some(ref cum) = cumulative_times {
+                let total = *cum.last().expect("prefix sum is non-empty");
+                let elapsed_time = cum[layers_seen as usize];
+                let pct = if total > 0.0 {
+                    ((elapsed_time / total) * 100.0).round().min(100.0) as u32
+                } else {
+                    ((f64::from(layers_seen) / f64::from(effective_layer_count)) * 100.0)
+                        .round()
+                        .min(100.0) as u32
+                };
+                let rem = if total > 0.0 {
+                    (((total - elapsed_time).max(0.0)) / 60.0).round() as u32
+                } else {
+                    0
+                };
+                (pct, rem)
+            } else {
+                // Linear fallback when per_layer_times is unavailable or mismatched.
+                let pct = ((f64::from(layers_seen) / f64::from(effective_layer_count)) * 100.0)
+                    .round()
+                    .min(100.0) as u32;
+                let elapsed_fraction =
+                    (f64::from(layers_seen) / f64::from(effective_layer_count)).min(1.0);
+                let remaining_fraction = (1.0 - elapsed_fraction).max(0.0);
+                let rem = ((estimated_time_seconds * remaining_fraction) / 60.0).round() as u32;
+                (pct, rem)
+            };
 
             let params = format!("P{percent} R{remaining_minutes}");
 
@@ -2062,6 +2166,7 @@ mod tests {
             dry_run: false,
             merge_collinear: false,
             insert_progress: true,
+            ..Default::default()
         }
     }
 
@@ -2102,7 +2207,7 @@ mod tests {
                 5,
             ),
         ];
-        let result = insert_progress_markers(cmds, 120.0, 2, &progress_config());
+        let result = insert_progress_markers(cmds, 120.0, 2, &[], &progress_config());
         let m73s: Vec<_> = result
             .commands
             .iter()
@@ -2149,7 +2254,7 @@ mod tests {
                 4,
             ),
         ];
-        let result = insert_progress_markers(cmds, 60.0, 1, &progress_config());
+        let result = insert_progress_markers(cmds, 60.0, 1, &[], &progress_config());
         let old_m73s: Vec<_> = result
             .commands
             .iter()
@@ -2181,7 +2286,7 @@ mod tests {
                 2,
             ),
         ];
-        let result = insert_progress_markers(cmds, 60.0, 1, &OptConfig::default());
+        let result = insert_progress_markers(cmds, 60.0, 1, &[], &OptConfig::default());
         assert!(result.diagnostics.is_empty());
         assert_eq!(result.commands.len(), 2);
     }
@@ -2207,7 +2312,7 @@ mod tests {
                 i * 2 + 3,
             ));
         }
-        let result = insert_progress_markers(cmds, 240.0, 4, &progress_config());
+        let result = insert_progress_markers(cmds, 240.0, 4, &[], &progress_config());
         let m73_params: Vec<String> = result
             .commands
             .iter()
@@ -2247,7 +2352,7 @@ mod tests {
                 3,
             ),
         ];
-        let result = insert_progress_markers(cmds, 60.0, 2, &progress_config());
+        let result = insert_progress_markers(cmds, 60.0, 2, &[], &progress_config());
         let m73s: Vec<_> = result
             .commands
             .iter()

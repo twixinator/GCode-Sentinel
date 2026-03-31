@@ -80,6 +80,8 @@ gcode-sentinel model.gcode --report-format json
 
 Prints a JSON report containing diagnostics, print statistics, and optimization changes. No G-Code output is written.
 
+> **Schema stability (0.x):** The JSON report schema (`AnalysisReport`, `OptimizationChange`) is not yet stable. Fields may be added or removed in any 0.x release. Pin to a specific version if you depend on the schema in automation.
+
 ### Save report to a file while also writing optimized G-Code
 
 ```sh
@@ -108,6 +110,12 @@ Prints debug-level tracing output to stderr. Controlled by `--verbose` or the `R
 | `--report-format <FMT>` | Report format: `text` (default) or `json` |
 | `-c, --config <PATH>` | Path to a TOML configuration file |
 | `-v, --verbose` | Enable debug output |
+| `--merge-collinear` | (Opt-in) Merge consecutive collinear G1 moves into one |
+| `--insert-progress` | Strip existing M73 markers and re-insert recalculated ones at each layer boundary |
+| `--trust-existing-m73` | When used with `--insert-progress`, preserve slicer M73 values instead of stripping them |
+| `--min-layer-time <SECONDS>` | Emit a `W003` warning for any layer below this estimated print time |
+| `--no-travel-merge` | Disable Rule 7 — keep all intermediate same-axis travel moves |
+| `--no-feedrate-strip` | Disable Rule 8 — preserve all `F` parameters even when redundant |
 
 ## Example output
 

@@ -115,10 +115,36 @@ pub struct Cli {
     #[arg(long)]
     pub insert_progress: bool,
 
-    /// Warn when any layer's estimated print time falls below this threshold
-    /// (in seconds).  Disabled when absent.
-    #[arg(long)]
+    /// Warn when any layer's estimated print time falls below this threshold.
+    /// Disabled when absent.
+    #[arg(long, value_name = "SECONDS")]
     pub min_layer_time: Option<f64>,
+
+    /// Disable Rule 7 — consecutive same-axis travel merging.
+    ///
+    /// By default the optimizer removes an earlier single-axis non-extruding
+    /// move when the very next move on the same axis (with the same feedrate)
+    /// supersedes it.  Pass this flag to keep all intermediate travel commands.
+    #[arg(long)]
+    pub no_travel_merge: bool,
+
+    /// Disable Rule 8 — redundant feedrate elimination.
+    ///
+    /// By default the optimizer strips the `F` parameter from moves whose
+    /// feedrate already matches the current modal feedrate.  Pass this flag to
+    /// preserve all feedrate annotations as-is.
+    #[arg(long)]
+    pub no_feedrate_strip: bool,
+
+    /// Preserve slicer-computed M73 progress markers instead of stripping them.
+    ///
+    /// By default `--insert-progress` strips all existing M73 commands and
+    /// inserts recalculated ones at every layer boundary.  When this flag is
+    /// set, existing M73 commands are kept in place and new markers are only
+    /// inserted at boundaries that do not already have one immediately
+    /// preceding them.  Has no effect when `--insert-progress` is not set.
+    #[arg(long)]
+    pub trust_existing_m73: bool,
 }
 
 impl Cli {

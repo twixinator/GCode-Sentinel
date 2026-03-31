@@ -214,14 +214,16 @@ pub fn analyze<'a>(
             severity: Severity::Info,
             line: 0,
             code: "I003",
-            message: "probable temperature tower detected (keyword in comments)".to_owned(),
+            message: "probable temperature tower detected (keyword in comments) — verify this is intentional".to_owned(),
         });
     } else if let Some(step_table) = detect_temp_tower_pattern(&printer.temp_changes) {
         diags.push(Diagnostic {
             severity: Severity::Info,
             line: 0,
             code: "I003",
-            message: format!("probable temperature tower detected: {step_table}"),
+            message: format!(
+                "probable temperature tower detected: {step_table} — verify this is intentional"
+            ),
         });
     }
 
@@ -657,14 +659,36 @@ fn parse_s_param(params: &str) -> Option<f64> {
 /// they represent a temperature tower.
 ///
 /// A temperature tower is characterised by:
-/// * At least 3 distinct temperature changes.
+/// Minimum number of distinct temperature steps required to emit I003.
+///
+/// Two or three changes is within normal multi-material behaviour;
+/// a real temperature tower typically has five or more steps.
+const MIN_TEMP_STEP_COUNT: usize = 4;
+
+/// Minimum total temperature span (max − min) in °C required to emit I003.
+///
+/// A ramp smaller than this is within normal variance of multi-material or
+/// material-change adjustments and should not be diagnosed as a tower.
+const MIN_TEMP_RANGE_CELSIUS: f64 = 10.0;
+
+/// * At least [`MIN_TEMP_STEP_COUNT`] distinct temperature changes.
+/// * Total temperature span of at least [`MIN_TEMP_RANGE_CELSIUS`] °C.
 /// * Z intervals between successive changes that are approximately uniform
 ///   (each within ±20 % of the median interval).
 /// * Temperatures that are monotonically increasing **or** decreasing throughout.
 ///
 /// Returns a human-readable step table string on detection, or `None` otherwise.
 fn detect_temp_tower_pattern(changes: &[(f64, f64)]) -> Option<String> {
-    if changes.len() < 3 {
+    if changes.len() < MIN_TEMP_STEP_COUNT {
+        return None;
+    }
+
+    // Guard: require a meaningful temperature span so that small multi-material
+    // ramps do not false-positive.
+    let temps: Vec<f64> = changes.iter().map(|(t, _)| *t).collect();
+    let t_min = temps.iter().copied().fold(f64::INFINITY, f64::min);
+    let t_max = temps.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if t_max - t_min < MIN_TEMP_RANGE_CELSIUS {
         return None;
     }
 
@@ -700,7 +724,6 @@ fn detect_temp_tower_pattern(changes: &[(f64, f64)]) -> Option<String> {
     }
 
     // Temperatures must be monotonically non-decreasing or non-increasing.
-    let temps: Vec<f64> = changes.iter().map(|(t, _)| *t).collect();
     let increasing = temps.windows(2).all(|w| w[1] >= w[0]);
     let decreasing = temps.windows(2).all(|w| w[1] <= w[0]);
     if !increasing && !decreasing {
@@ -1283,6 +1306,53 @@ mod tests {
             i003.len(),
             1,
             "comment with 'temperature tower' should emit I003"
+        );
+    }
+
+    #[test]
+    fn test_temp_tower_multimaterial_ramp_no_trigger() {
+        // 3 temperature changes (200, 202, 204) — below MIN_TEMP_STEP_COUNT=4.
+        // Span = 4 °C — below MIN_TEMP_RANGE_CELSIUS=10.0.
+        // With the old guard (< 3), 3 changes would have passed and triggered I003.
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(
+                linear(Some(10.0), None, Some(5.0), Some(1.0), Some(3000.0)),
+                2,
+            ),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S200"),
+                },
+                3,
+            ),
+            sp(linear(Some(20.0), None, Some(10.0), Some(2.0), None), 4),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S202"),
+                },
+                5,
+            ),
+            sp(linear(Some(30.0), None, Some(15.0), Some(3.0), None), 6),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S204"),
+                },
+                7,
+            ),
+        ];
+        let result = analyze(cmds.iter(), None);
+        let i003: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "I003")
+            .collect();
+        assert!(
+            i003.is_empty(),
+            "multi-material ramp with small span and few steps should not trigger I003"
         );
     }
 

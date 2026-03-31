@@ -327,6 +327,7 @@ fn m73_insertion_malm_slide() {
         opt.commands,
         pre.stats.estimated_time_seconds,
         pre.stats.layer_count,
+        &pre.stats.per_layer_times,
         &config,
     );
 
@@ -389,6 +390,7 @@ fn full_v21_pipeline_malm_slide() {
         dry_run: false,
         merge_collinear: true,
         insert_progress: true,
+        ..Default::default()
     };
 
     let merged = merge_collinear(cmds, &config);
@@ -397,6 +399,7 @@ fn full_v21_pipeline_malm_slide() {
         optimized.commands,
         pre.stats.estimated_time_seconds,
         pre.stats.layer_count,
+        &pre.stats.per_layer_times,
         &config,
     );
 
@@ -429,6 +432,7 @@ fn full_v21_pipeline_rose() {
         dry_run: false,
         merge_collinear: true,
         insert_progress: true,
+        ..Default::default()
     };
 
     let merged = merge_collinear(cmds, &config);
@@ -437,6 +441,7 @@ fn full_v21_pipeline_rose() {
         optimized.commands,
         pre.stats.estimated_time_seconds,
         pre.stats.layer_count,
+        &pre.stats.per_layer_times,
         &config,
     );
 
