@@ -209,6 +209,21 @@ pub fn fit_arcs<'a>(
             flush_candidate(&mut candidate, &mut result_commands, &mut changes, config);
             cur_x = resolve_x_from_cmd(&spanned.inner, cur_x);
             cur_y = resolve_y_from_cmd(&spanned.inner, cur_y);
+            // G92 SetPosition resets the logical machine position without moving.
+            // We must update cur_x/cur_y/cur_e here so that subsequent LinearMoves
+            // that omit X or Y resolve the correct absolute coordinate, and so that
+            // e_delta computation against cur_e stays accurate after the reset.
+            if let GCodeCommand::SetPosition { x, y, e, .. } = &spanned.inner {
+                if let Some(v) = x {
+                    cur_x = *v;
+                }
+                if let Some(v) = y {
+                    cur_y = *v;
+                }
+                if let Some(v) = e {
+                    cur_e = *v;
+                }
+            }
             result_commands.push(spanned);
         }
     }
