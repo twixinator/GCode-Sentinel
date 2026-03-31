@@ -213,16 +213,18 @@ pub fn fit_arcs<'a>(
             // We must update cur_x/cur_y/cur_e here so that subsequent LinearMoves
             // that omit X or Y resolve the correct absolute coordinate, and so that
             // e_delta computation against cur_e stays accurate after the reset.
-            if let GCodeCommand::SetPosition { x, y, e, .. } = &spanned.inner {
-                if let Some(v) = x {
-                    cur_x = *v;
-                }
-                if let Some(v) = y {
-                    cur_y = *v;
-                }
-                if let Some(v) = e {
+            // Note: cur_x/cur_y are already handled by resolve_x/y_from_cmd above
+            // for SetPosition; only cur_e remains unique to this block.
+            if let GCodeCommand::SetPosition { e: Some(v), .. } = &spanned.inner {
+                cur_e = *v;
+            }
+            // Update cur_e from pre-existing arc moves (e.g. arcs already in input).
+            match &spanned.inner {
+                GCodeCommand::ArcMoveCW { e: Some(v), .. }
+                | GCodeCommand::ArcMoveCCW { e: Some(v), .. } => {
                     cur_e = *v;
                 }
+                _ => {}
             }
             result_commands.push(spanned);
         }
@@ -417,18 +419,25 @@ fn flush_candidate<'a>(
 }
 
 /// Update the current X position from a non-`LinearMove` command if it carries
-/// explicit coordinates (e.g. `RapidMove`).
+/// explicit coordinates (e.g. `RapidMove`, arc moves, or `SetPosition`).
 fn resolve_x_from_cmd(cmd: &GCodeCommand<'_>, current: f64) -> f64 {
     match cmd {
-        GCodeCommand::RapidMove { x: Some(v), .. } => *v,
+        GCodeCommand::RapidMove { x: Some(v), .. }
+        | GCodeCommand::ArcMoveCW { x: Some(v), .. }
+        | GCodeCommand::ArcMoveCCW { x: Some(v), .. }
+        | GCodeCommand::SetPosition { x: Some(v), .. } => *v,
         _ => current,
     }
 }
 
-/// Update the current Y position from a non-`LinearMove` command.
+/// Update the current Y position from a non-`LinearMove` command if it carries
+/// explicit coordinates (e.g. `RapidMove`, arc moves, or `SetPosition`).
 fn resolve_y_from_cmd(cmd: &GCodeCommand<'_>, current: f64) -> f64 {
     match cmd {
-        GCodeCommand::RapidMove { y: Some(v), .. } => *v,
+        GCodeCommand::RapidMove { y: Some(v), .. }
+        | GCodeCommand::ArcMoveCW { y: Some(v), .. }
+        | GCodeCommand::ArcMoveCCW { y: Some(v), .. }
+        | GCodeCommand::SetPosition { y: Some(v), .. } => *v,
         _ => current,
     }
 }
