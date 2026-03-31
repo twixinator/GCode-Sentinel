@@ -36,6 +36,12 @@ pub struct AnalysisResult {
 /// Mutable simulation state threaded through the analyser.
 ///
 /// This is an internal implementation detail; callers only see [`AnalysisResult`].
+///
+/// The struct has four independent boolean flags (`is_absolute`, `e_absolute`,
+/// `has_layer_change_comments`, `has_temp_tower_comment`), each representing
+/// a genuinely orthogonal binary property of the simulation state.  A state
+/// machine would add indirection without clarity gain here.
+#[allow(clippy::struct_excessive_bools)]
 struct PrinterState {
     /// Current tool position in absolute machine coordinates (mm).
     pos: Point3D,
@@ -56,6 +62,30 @@ struct PrinterState {
     /// Only merged into `PrintStats::layer_count` at the end if no
     /// `;LAYER_CHANGE` comments were encountered.
     z_layer_count: u32,
+    /// Per-layer times collected via Z-based detection.
+    ///
+    /// Kept separate from `PrintStats::per_layer_times` because we only know
+    /// at the end of the file whether `LAYER_CHANGE` comments are authoritative.
+    /// Merged into `PrintStats::per_layer_times` at finalisation iff no
+    /// `;LAYER_CHANGE` comments were seen.
+    z_layer_times: Vec<f64>,
+    /// Accumulated move time for the current layer (seconds).
+    ///
+    /// Shared between both detection paths.  Reset to zero each time a layer
+    /// boundary is committed (comment path → directly to `PrintStats`; Z path
+    /// → to `z_layer_times`).
+    current_layer_time: f64,
+    /// Temperature changes recorded during the print: `(temperature_c, z_mm)`.
+    ///
+    /// Populated by M104/M109 commands.  Used at finalisation to detect
+    /// temperature tower patterns.
+    temp_changes: Vec<(f64, f64)>,
+    /// Most recent hotend temperature set via M104/M109.  Used to suppress
+    /// duplicate entries when the same temperature is commanded twice.
+    last_hotend_temp: Option<f64>,
+    /// Set to `true` when a comment containing "temperature tower" or "temp tower"
+    /// is encountered.  Triggers I003 without requiring a pattern analysis.
+    has_temp_tower_comment: bool,
 }
 
 impl Default for PrinterState {
@@ -69,6 +99,11 @@ impl Default for PrinterState {
             last_z: 0.0,
             has_layer_change_comments: false,
             z_layer_count: 0,
+            z_layer_times: Vec::new(),
+            current_layer_time: 0.0,
+            temp_changes: Vec::new(),
+            last_hotend_temp: None,
+            has_temp_tower_comment: false,
         }
     }
 }
@@ -155,8 +190,41 @@ pub fn analyze<'a>(
 
     // If the file contained no `;LAYER_CHANGE` comments, fall back to
     // Z-based layer detection.  Otherwise the comment count is authoritative.
-    if !printer.has_layer_change_comments {
+    if printer.has_layer_change_comments {
+        // Comment path: push the final layer's time (the last layer has no
+        // subsequent LAYER_CHANGE to trigger its push).
+        if print_stats.layer_count > 0 {
+            print_stats.per_layer_times.push(printer.current_layer_time);
+        }
+    } else {
+        // Z-based fallback: adopt z_layer_count and z_layer_times.
         print_stats.layer_count = printer.z_layer_count;
+        // Append the final layer's time to the Z buffer, then move the whole
+        // buffer into per_layer_times.
+        if !printer.z_layer_times.is_empty() {
+            printer.z_layer_times.push(printer.current_layer_time);
+        }
+        print_stats.per_layer_times = printer.z_layer_times;
+    }
+
+    // Temperature tower detection: comment keyword takes priority; fall back to
+    // staircase pattern analysis on M104/M109 records.
+    if printer.has_temp_tower_comment {
+        diags.push(Diagnostic {
+            severity: Severity::Info,
+            line: 0,
+            code: "I003",
+            message: "probable temperature tower detected (keyword in comments) — verify this is intentional".to_owned(),
+        });
+    } else if let Some(step_table) = detect_temp_tower_pattern(&printer.temp_changes) {
+        diags.push(Diagnostic {
+            severity: Severity::Info,
+            line: 0,
+            code: "I003",
+            message: format!(
+                "probable temperature tower detected: {step_table} — verify this is intentional"
+            ),
+        });
     }
 
     AnalysisResult {
@@ -176,12 +244,7 @@ fn process_command<'a>(
     limits: Option<&MachineLimits>,
 ) {
     match &spanned.inner {
-        GCodeCommand::RapidMove {
-            x,
-            y,
-            z,
-            f,
-        } => {
+        GCodeCommand::RapidMove { x, y, z, f } => {
             let params = AxisParams {
                 target_x: *x,
                 target_y: *y,
@@ -215,7 +278,27 @@ fn process_command<'a>(
         GCodeCommand::Comment { text } => {
             handle_comment(text, outputs.printer, outputs.print_stats);
         }
-        // GCommand, MetaCommand, Unknown: no motion semantics — skip.
+        // M104 / M109 — hotend temperature set/wait.  Track for temperature
+        // tower pattern detection; all other M-codes have no motion semantics.
+        GCodeCommand::MetaCommand {
+            code: 104 | 109,
+            params,
+        } => {
+            if let Some(temp) = parse_s_param(params.as_ref()) {
+                if outputs
+                    .printer
+                    .last_hotend_temp
+                    .map_or(true, |prev| (prev - temp).abs() > 0.1)
+                {
+                    outputs
+                        .printer
+                        .temp_changes
+                        .push((temp, outputs.printer.pos.z));
+                    outputs.printer.last_hotend_temp = Some(temp);
+                }
+            }
+        }
+        // GCommand, remaining MetaCommands, Unknown: no motion semantics — skip.
         GCodeCommand::GCommand { .. }
         | GCodeCommand::MetaCommand { .. }
         | GCodeCommand::Unknown { .. } => {}
@@ -247,6 +330,11 @@ fn handle_move(
     let travel = euclidean_distance(&outputs.printer.pos, &dest);
     update_move_stats(travel, outputs.printer.feedrate, outputs.print_stats);
     update_bbox(&dest, outputs.print_stats);
+
+    // Accumulate per-layer time for G0 moves.
+    if outputs.printer.feedrate > 0.0 {
+        outputs.printer.current_layer_time += travel / (outputs.printer.feedrate / 60.0);
+    }
 
     outputs.printer.pos = dest;
 }
@@ -289,6 +377,21 @@ fn handle_linear_move(
     // When the file contains `;LAYER_CHANGE` comments (OrcaSlicer), those are the
     // sole source of truth — Z-hops during retraction must not inflate the count.
     if params.target_z.is_some() && dest.z > outputs.printer.last_z {
+        // Push the accumulated time for the layer that just ended into the
+        // Z-based times buffer, then reset.  Only do this in Z-fallback mode:
+        // when LAYER_CHANGE comments are present, `handle_comment` owns the
+        // per-layer time tracking and Z hops must not corrupt the accumulator.
+        if !outputs.printer.has_layer_change_comments {
+            if outputs.printer.current_layer_time > 0.0 || !outputs.printer.z_layer_times.is_empty()
+            {
+                outputs
+                    .printer
+                    .z_layer_times
+                    .push(outputs.printer.current_layer_time);
+            }
+            outputs.printer.current_layer_time = 0.0;
+        }
+
         outputs.printer.z_layer_count += 1;
         outputs.diags.push(Diagnostic {
             severity: Severity::Info,
@@ -296,8 +399,7 @@ fn handle_linear_move(
             code: "I001",
             message: format!(
                 "layer change detected: Z {:.3} → {:.3}",
-                outputs.printer.last_z,
-                dest.z,
+                outputs.printer.last_z, dest.z,
             ),
         });
         outputs.printer.last_z = dest.z;
@@ -306,6 +408,12 @@ fn handle_linear_move(
     let travel = euclidean_distance(&outputs.printer.pos, &dest);
     update_move_stats(travel, outputs.printer.feedrate, outputs.print_stats);
     update_bbox(&dest, outputs.print_stats);
+
+    // Accumulate per-layer time for G1 moves (after the layer-boundary push so
+    // this move's time is attributed to the new layer).
+    if outputs.printer.feedrate > 0.0 {
+        outputs.printer.current_layer_time += travel / (outputs.printer.feedrate / 60.0);
+    }
 
     outputs.printer.pos = dest;
 }
@@ -359,6 +467,20 @@ fn handle_comment<S: AsRef<str>>(
     if text.as_ref() == "LAYER_CHANGE" {
         printer.has_layer_change_comments = true;
         print_stats.layer_count += 1;
+        // Push the accumulated time for the layer that just ended, then reset.
+        // Any moves that follow belong to the new layer.
+        if printer.current_layer_time > 0.0 || !print_stats.per_layer_times.is_empty() {
+            print_stats.per_layer_times.push(printer.current_layer_time);
+        }
+        printer.current_layer_time = 0.0;
+    }
+
+    // Detect temperature tower keyword in comment text.  We intentionally
+    // require "temperature tower" or "temp tower" — bare "calibration" is far
+    // too broad and would fire on every flow/retraction calibration print.
+    let lower = text.as_ref().to_ascii_lowercase();
+    if lower.contains("temperature tower") || lower.contains("temp tower") {
+        printer.has_temp_tower_comment = true;
     }
 }
 
@@ -518,6 +640,104 @@ fn emit_retraction_diagnostic(line: u32, e_delta: f64, diags: &mut Vec<Diagnosti
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Temperature tower helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parse the `S` (or `s`) parameter value from a whitespace-separated param string.
+///
+/// Returns the first successfully parsed `S` value, or `None` if no such token exists.
+fn parse_s_param(params: &str) -> Option<f64> {
+    for token in params.split_whitespace() {
+        if let Some(val_str) = token.strip_prefix('S').or_else(|| token.strip_prefix('s')) {
+            return val_str.parse().ok();
+        }
+    }
+    None
+}
+
+/// Analyse a sequence of `(temperature, z)` change records to determine whether
+/// they represent a temperature tower.
+///
+/// A temperature tower is characterised by:
+/// Minimum number of distinct temperature steps required to emit I003.
+///
+/// Two or three changes is within normal multi-material behaviour;
+/// a real temperature tower typically has five or more steps.
+const MIN_TEMP_STEP_COUNT: usize = 4;
+
+/// Minimum total temperature span (max − min) in °C required to emit I003.
+///
+/// A ramp smaller than this is within normal variance of multi-material or
+/// material-change adjustments and should not be diagnosed as a tower.
+const MIN_TEMP_RANGE_CELSIUS: f64 = 10.0;
+
+/// * At least [`MIN_TEMP_STEP_COUNT`] distinct temperature changes.
+/// * Total temperature span of at least [`MIN_TEMP_RANGE_CELSIUS`] °C.
+/// * Z intervals between successive changes that are approximately uniform
+///   (each within ±20 % of the median interval).
+/// * Temperatures that are monotonically increasing **or** decreasing throughout.
+///
+/// Returns a human-readable step table string on detection, or `None` otherwise.
+fn detect_temp_tower_pattern(changes: &[(f64, f64)]) -> Option<String> {
+    if changes.len() < MIN_TEMP_STEP_COUNT {
+        return None;
+    }
+
+    // Guard: require a meaningful temperature span so that small multi-material
+    // ramps do not false-positive.
+    let temps: Vec<f64> = changes.iter().map(|(t, _)| *t).collect();
+    let t_min = temps.iter().copied().fold(f64::INFINITY, f64::min);
+    let t_max = temps.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if t_max - t_min < MIN_TEMP_RANGE_CELSIUS {
+        return None;
+    }
+
+    let mut z_intervals: Vec<f64> = changes
+        .windows(2)
+        .map(|w| (w[1].1 - w[0].1).abs())
+        .collect();
+
+    // Discard zero-height intervals — these occur when temperature is set
+    // before the first Z move and should not disqualify the pattern.
+    z_intervals.retain(|&z| z > 0.1);
+    if z_intervals.len() < 2 {
+        return None;
+    }
+
+    // Use the median as the reference interval so a single outlier does not
+    // disqualify a genuine tower.
+    let mut sorted = z_intervals.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = sorted[sorted.len() / 2];
+
+    if median < 0.1 {
+        return None;
+    }
+
+    // All non-trivial intervals must be within ±20 % of the median.
+    let regular = z_intervals
+        .iter()
+        .all(|&z| (0.8..=1.2).contains(&(z / median)));
+
+    if !regular {
+        return None;
+    }
+
+    // Temperatures must be monotonically non-decreasing or non-increasing.
+    let increasing = temps.windows(2).all(|w| w[1] >= w[0]);
+    let decreasing = temps.windows(2).all(|w| w[1] <= w[0]);
+    if !increasing && !decreasing {
+        return None;
+    }
+
+    let steps: Vec<String> = changes
+        .iter()
+        .map(|(temp, z)| format!("{temp:.0}C@Z{z:.1}"))
+        .collect();
+    Some(steps.join(", "))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -574,8 +794,14 @@ mod tests {
     fn test_absolute_move_bbox() {
         let cmds = vec![
             sp(GCodeCommand::SetAbsolute, 1),
-            sp(linear(Some(10.0), Some(20.0), Some(5.0), Some(1.0), None), 2),
-            sp(linear(Some(50.0), Some(80.0), Some(5.0), Some(2.0), None), 3),
+            sp(
+                linear(Some(10.0), Some(20.0), Some(5.0), Some(1.0), None),
+                2,
+            ),
+            sp(
+                linear(Some(50.0), Some(80.0), Some(5.0), Some(2.0), None),
+                3,
+            ),
         ];
         let result = analyze(cmds.iter(), None);
 
@@ -839,6 +1065,82 @@ mod tests {
         assert_eq!(w001[0].severity, Severity::Warning);
     }
 
+    // ── Per-layer time tracking ──────────────────────────────────────────
+
+    #[test]
+    fn test_per_layer_times_populated() {
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(
+                GCodeCommand::Comment {
+                    text: Cow::Borrowed("LAYER_CHANGE"),
+                },
+                2,
+            ),
+            sp(
+                linear(Some(100.0), None, Some(0.2), Some(1.0), Some(6000.0)),
+                3,
+            ),
+            sp(
+                GCodeCommand::Comment {
+                    text: Cow::Borrowed("LAYER_CHANGE"),
+                },
+                4,
+            ),
+            sp(
+                linear(Some(300.0), None, Some(0.4), Some(2.0), Some(6000.0)),
+                5,
+            ),
+        ];
+        let result = analyze(cmds.iter(), None);
+        assert_eq!(
+            result.stats.per_layer_times.len(),
+            2,
+            "should have 2 layer times"
+        );
+        assert!(
+            (result.stats.per_layer_times[0] - 1.0).abs() < 0.1,
+            "layer 1 time should be ~1.0s, got {}",
+            result.stats.per_layer_times[0]
+        );
+        assert!(
+            result.stats.per_layer_times[1] > 0.0,
+            "layer 2 time should be > 0, got {}",
+            result.stats.per_layer_times[1]
+        );
+    }
+
+    #[test]
+    fn test_per_layer_times_z_fallback() {
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(
+                linear(Some(100.0), None, Some(0.2), Some(1.0), Some(6000.0)),
+                2,
+            ),
+            sp(
+                linear(Some(200.0), None, Some(0.4), Some(2.0), Some(6000.0)),
+                3,
+            ),
+        ];
+        let result = analyze(cmds.iter(), None);
+        assert_eq!(
+            result.stats.per_layer_times.len(),
+            2,
+            "Z-based layers should also track times"
+        );
+    }
+
+    #[test]
+    fn test_per_layer_times_empty_for_no_layers() {
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(linear(Some(10.0), Some(20.0), None, None, None), 2),
+        ];
+        let result = analyze(cmds.iter(), None);
+        assert!(result.stats.per_layer_times.is_empty());
+    }
+
     // ── 10. Filament accounting: only positive deltas count ──────────────────
 
     #[test]
@@ -858,6 +1160,222 @@ mod tests {
             (result.stats.total_filament_mm - 10.0).abs() < 1e-9,
             "expected 10.0, got {}",
             result.stats.total_filament_mm
+        );
+    }
+
+    // ── Temperature tower detection ──────────────────────────────────────────
+
+    #[test]
+    fn test_temp_tower_detected_synthetic() {
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(
+                linear(Some(10.0), None, Some(5.0), Some(1.0), Some(3000.0)),
+                2,
+            ),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S200"),
+                },
+                3,
+            ),
+            sp(linear(Some(20.0), None, Some(10.0), Some(2.0), None), 4),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S205"),
+                },
+                5,
+            ),
+            sp(linear(Some(30.0), None, Some(15.0), Some(3.0), None), 6),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S210"),
+                },
+                7,
+            ),
+            sp(linear(Some(40.0), None, Some(20.0), Some(4.0), None), 8),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S215"),
+                },
+                9,
+            ),
+            sp(linear(Some(50.0), None, Some(25.0), Some(5.0), None), 10),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S220"),
+                },
+                11,
+            ),
+        ];
+        let result = analyze(cmds.iter(), None);
+        let i003: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "I003")
+            .collect();
+        assert_eq!(i003.len(), 1, "should detect temperature tower");
+        assert!(i003[0].message.contains("temperature tower"));
+    }
+
+    #[test]
+    fn test_temp_tower_not_detected_normal_print() {
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S200"),
+                },
+                2,
+            ),
+            sp(
+                linear(Some(10.0), None, Some(0.2), Some(1.0), Some(3000.0)),
+                3,
+            ),
+            sp(linear(Some(20.0), None, Some(0.4), Some(2.0), None), 4),
+        ];
+        let result = analyze(cmds.iter(), None);
+        let i003: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "I003")
+            .collect();
+        assert!(i003.is_empty(), "normal print should not trigger I003");
+    }
+
+    #[test]
+    fn test_temp_tower_fewer_than_three_changes() {
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(
+                linear(Some(10.0), None, Some(5.0), Some(1.0), Some(3000.0)),
+                2,
+            ),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S200"),
+                },
+                3,
+            ),
+            sp(linear(Some(20.0), None, Some(10.0), Some(2.0), None), 4),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S210"),
+                },
+                5,
+            ),
+        ];
+        let result = analyze(cmds.iter(), None);
+        let i003: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "I003")
+            .collect();
+        assert!(
+            i003.is_empty(),
+            "fewer than 3 changes should not trigger I003"
+        );
+    }
+
+    #[test]
+    fn test_temp_tower_comment_detection() {
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(
+                GCodeCommand::Comment {
+                    text: Cow::Borrowed("Temperature Tower test"),
+                },
+                2,
+            ),
+        ];
+        let result = analyze(cmds.iter(), None);
+        let i003: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "I003")
+            .collect();
+        assert_eq!(
+            i003.len(),
+            1,
+            "comment with 'temperature tower' should emit I003"
+        );
+    }
+
+    #[test]
+    fn test_temp_tower_multimaterial_ramp_no_trigger() {
+        // 3 temperature changes (200, 202, 204) — below MIN_TEMP_STEP_COUNT=4.
+        // Span = 4 °C — below MIN_TEMP_RANGE_CELSIUS=10.0.
+        // With the old guard (< 3), 3 changes would have passed and triggered I003.
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(
+                linear(Some(10.0), None, Some(5.0), Some(1.0), Some(3000.0)),
+                2,
+            ),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S200"),
+                },
+                3,
+            ),
+            sp(linear(Some(20.0), None, Some(10.0), Some(2.0), None), 4),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S202"),
+                },
+                5,
+            ),
+            sp(linear(Some(30.0), None, Some(15.0), Some(3.0), None), 6),
+            sp(
+                GCodeCommand::MetaCommand {
+                    code: 104,
+                    params: Cow::Borrowed("S204"),
+                },
+                7,
+            ),
+        ];
+        let result = analyze(cmds.iter(), None);
+        let i003: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "I003")
+            .collect();
+        assert!(
+            i003.is_empty(),
+            "multi-material ramp with small span and few steps should not trigger I003"
+        );
+    }
+
+    #[test]
+    fn test_temp_tower_bare_calibration_no_trigger() {
+        let cmds = vec![
+            sp(GCodeCommand::SetAbsolute, 1),
+            sp(
+                GCodeCommand::Comment {
+                    text: Cow::Borrowed("Flow calibration complete"),
+                },
+                2,
+            ),
+        ];
+        let result = analyze(cmds.iter(), None);
+        let i003: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "I003")
+            .collect();
+        assert!(
+            i003.is_empty(),
+            "bare 'calibration' should not trigger I003"
         );
     }
 }

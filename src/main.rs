@@ -37,12 +37,35 @@ fn main() -> Result<()> {
     // JSON-to-stdout without --report-file implies check-only (no G-Code written).
     let effective_dry_run =
         cli.check_only || (cli.report_format == ReportFormat::Json && cli.report_file.is_none());
-    let opt_config = OptConfig { dry_run: effective_dry_run };
-    let opt_result = optimize(commands, &opt_config);
-    log_optimization(opt_result.changes.len(), effective_dry_run);
+    let opt_config = OptConfig {
+        dry_run: effective_dry_run,
+        merge_collinear: cli.merge_collinear,
+        insert_progress: cli.insert_progress,
+        no_travel_merge: cli.no_travel_merge,
+        no_feedrate_strip: cli.no_feedrate_strip,
+        trust_existing_m73: cli.trust_existing_m73,
+    };
 
-    // Re-analyze the (possibly reduced) command list to detect regressions.
-    let post_analysis = analyze(opt_result.commands.iter(), limits.as_ref());
+    // Pre-pass: collinear merge (opt-in).
+    let merge_result = gcode_sentinel::optimizer::merge_collinear(commands, &opt_config);
+    let mut all_changes = merge_result.changes;
+
+    // Main optimizer pass.
+    let opt_result = optimize(merge_result.commands, &opt_config);
+    all_changes.extend(opt_result.changes);
+    log_optimization(all_changes.len(), effective_dry_run);
+
+    // Post-pass: M73 progress markers (opt-in).
+    let progress_result = gcode_sentinel::optimizer::insert_progress_markers(
+        opt_result.commands,
+        pre_analysis.stats.estimated_time_seconds,
+        pre_analysis.stats.layer_count,
+        &pre_analysis.stats.per_layer_times,
+        &opt_config,
+    );
+
+    // Re-analyze the final command list to detect regressions.
+    let post_analysis = analyze(progress_result.commands.iter(), limits.as_ref());
     let diff = ValidationDiff::compute(&pre_analysis.diagnostics, &post_analysis.diagnostics);
     if diff.regression_detected {
         for e in &diff.new_errors {
@@ -59,7 +82,30 @@ fn main() -> Result<()> {
         );
     }
 
-    let report = build_report(post_analysis, opt_result.changes, effective_dry_run);
+    let mut report = build_report(post_analysis, all_changes, effective_dry_run);
+
+    // Add progress insertion diagnostics.
+    report.diagnostics.extend(progress_result.diagnostics);
+
+    // Minimum layer time advisory (W003).
+    if let Some(threshold) = cli.min_layer_time {
+        for (i, &layer_time) in report.stats.per_layer_times.iter().enumerate() {
+            if layer_time < threshold {
+                report
+                    .diagnostics
+                    .push(gcode_sentinel::diagnostics::Diagnostic {
+                        severity: Severity::Warning,
+                        line: 0,
+                        code: "W003",
+                        message: format!(
+                            "layer {} print time {layer_time:.1}s is below minimum {threshold}s",
+                            i + 1,
+                        ),
+                    });
+            }
+        }
+    }
+
     print_report(&report)?;
     write_report_file(&cli, &report)?;
 
@@ -79,7 +125,7 @@ fn main() -> Result<()> {
     }
 
     if !effective_dry_run {
-        write_output(&cli, &opt_result.commands)?;
+        write_output(&cli, &progress_result.commands)?;
     }
 
     Ok(())
@@ -88,14 +134,13 @@ fn main() -> Result<()> {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn init_tracing(verbose: bool) -> Result<()> {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| {
-            if verbose {
-                tracing_subscriber::EnvFilter::new("debug")
-            } else {
-                tracing_subscriber::EnvFilter::new("info")
-            }
-        });
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        if verbose {
+            tracing_subscriber::EnvFilter::new("debug")
+        } else {
+            tracing_subscriber::EnvFilter::new("info")
+        }
+    });
     let subscriber = tracing_subscriber::fmt().with_env_filter(filter).finish();
     tracing::subscriber::set_global_default(subscriber)
         .context("failed to initialise tracing subscriber")
@@ -112,9 +157,7 @@ fn validate_input(cli: &Cli) -> Result<()> {
 }
 
 fn validate_cli_flags(cli: &Cli) -> Result<()> {
-    if cli.report_format == ReportFormat::Json
-        && cli.report_file.is_none()
-        && cli.output.is_some()
+    if cli.report_format == ReportFormat::Json && cli.report_file.is_none() && cli.output.is_some()
     {
         anyhow::bail!(
             "--report-format json without --report-file cannot be combined with --output \
@@ -126,7 +169,12 @@ fn validate_cli_flags(cli: &Cli) -> Result<()> {
 
 fn log_limits(limits: Option<&gcode_sentinel::models::MachineLimits>) {
     if let Some(lim) = limits {
-        info!(max_x = lim.max_x, max_y = lim.max_y, max_z = lim.max_z, "machine limits loaded");
+        info!(
+            max_x = lim.max_x,
+            max_y = lim.max_y,
+            max_z = lim.max_z,
+            "machine limits loaded"
+        );
     } else {
         info!("no machine limits provided — out-of-bounds checking disabled");
     }
@@ -153,15 +201,24 @@ fn log_analysis(diagnostics: &[gcode_sentinel::diagnostics::Diagnostic]) {
     if diagnostics.is_empty() {
         info!("analysis complete — no issues found");
     } else {
-        let errors = diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
-        let warnings = diagnostics.iter().filter(|d| d.severity == Severity::Warning).count();
+        let errors = diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count();
+        let warnings = diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .count();
         info!(errors, warnings, "analysis complete");
     }
 }
 
 fn log_optimization(change_count: usize, dry_run: bool) {
     if dry_run {
-        info!(proposed_removals = change_count, "dry-run: no output written");
+        info!(
+            proposed_removals = change_count,
+            "dry-run: no output written"
+        );
     } else {
         info!(removed = change_count, "optimization complete");
     }
@@ -182,7 +239,9 @@ fn build_report(
 
 fn print_report(report: &AnalysisReport) -> Result<()> {
     let mut summary = String::new();
-    report.write_summary(&mut summary).context("failed to format report")?;
+    report
+        .write_summary(&mut summary)
+        .context("failed to format report")?;
     eprintln!("{summary}");
     if report.has_errors() {
         warn!(

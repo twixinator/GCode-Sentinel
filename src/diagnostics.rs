@@ -100,6 +100,11 @@ pub struct PrintStats {
 
     /// Maximum corner of the axis-aligned bounding box of all moves.
     pub bbox_max: crate::models::Point3D,
+
+    /// Estimated print time for each layer, in seconds.
+    ///
+    /// Populated during analysis; one entry per detected layer change.
+    pub per_layer_times: Vec<f64>,
 }
 
 impl Default for PrintStats {
@@ -110,8 +115,17 @@ impl Default for PrintStats {
             total_filament_mm: 0.0,
             estimated_time_seconds: 0.0,
             move_count: 0,
-            bbox_min: crate::models::Point3D { x: f64::MAX, y: f64::MAX, z: f64::MAX },
-            bbox_max: crate::models::Point3D { x: f64::MIN, y: f64::MIN, z: f64::MIN },
+            bbox_min: crate::models::Point3D {
+                x: f64::MAX,
+                y: f64::MAX,
+                z: f64::MAX,
+            },
+            bbox_max: crate::models::Point3D {
+                x: f64::MIN,
+                y: f64::MIN,
+                z: f64::MIN,
+            },
+            per_layer_times: Vec::new(),
         }
     }
 }
@@ -156,13 +170,18 @@ impl AnalysisReport {
     /// Returns `true` if any diagnostic has [`Severity::Error`].
     #[must_use]
     pub fn has_errors(&self) -> bool {
-        self.diagnostics.iter().any(|d| d.severity == Severity::Error)
+        self.diagnostics
+            .iter()
+            .any(|d| d.severity == Severity::Error)
     }
 
     /// Returns the count of diagnostics at or above the given severity.
     #[must_use]
     pub fn count_at_least(&self, min: Severity) -> usize {
-        self.diagnostics.iter().filter(|d| d.severity >= min).count()
+        self.diagnostics
+            .iter()
+            .filter(|d| d.severity >= min)
+            .count()
     }
 
     /// Writes a human-readable summary to the given writer.
@@ -174,28 +193,12 @@ impl AnalysisReport {
         writeln!(writer, "═══ GCode-Sentinel Report ═══")?;
         writeln!(writer, "Layers    : {}", self.stats.layer_count)?;
         writeln!(writer, "Moves     : {}", self.stats.move_count)?;
-        writeln!(
-            writer,
-            "Distance  : {:.1} mm",
-            self.stats.total_distance_mm
-        )?;
-        writeln!(
-            writer,
-            "Filament  : {:.1} mm",
-            self.stats.total_filament_mm
-        )?;
+        writeln!(writer, "Distance  : {:.1} mm", self.stats.total_distance_mm)?;
+        writeln!(writer, "Filament  : {:.1} mm", self.stats.total_filament_mm)?;
         let mins = self.stats.estimated_time_seconds / 60.0;
         writeln!(writer, "Est. time : {mins:.0} min")?;
-        writeln!(
-            writer,
-            "Bbox min  : {}",
-            self.stats.bbox_min
-        )?;
-        writeln!(
-            writer,
-            "Bbox max  : {}",
-            self.stats.bbox_max
-        )?;
+        writeln!(writer, "Bbox min  : {}", self.stats.bbox_min)?;
+        writeln!(writer, "Bbox max  : {}", self.stats.bbox_max)?;
 
         if self.diagnostics.is_empty() {
             writeln!(writer, "\nNo issues found.")?;
@@ -207,7 +210,11 @@ impl AnalysisReport {
         }
 
         if !self.changes.is_empty() {
-            let label = if self.dry_run { "Would optimize" } else { "Optimized" };
+            let label = if self.dry_run {
+                "Would optimize"
+            } else {
+                "Optimized"
+            };
             writeln!(writer, "\n{label} ({} changes):", self.changes.len())?;
             for c in &self.changes {
                 writeln!(writer, "  line {}: {}", c.line, c.description)?;
@@ -248,10 +255,14 @@ impl ValidationDiff {
     /// detection; warnings and info diagnostics are ignored.
     #[must_use]
     pub fn compute(pre: &[Diagnostic], post: &[Diagnostic]) -> Self {
-        let pre_errors: Vec<&Diagnostic> =
-            pre.iter().filter(|d| d.severity == Severity::Error).collect();
-        let post_errors: Vec<&Diagnostic> =
-            post.iter().filter(|d| d.severity == Severity::Error).collect();
+        let pre_errors: Vec<&Diagnostic> = pre
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        let post_errors: Vec<&Diagnostic> = post
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
 
         let new_errors: Vec<Diagnostic> = post_errors
             .iter()

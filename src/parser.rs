@@ -64,7 +64,9 @@ pub fn parse_line(
 /// let results: Vec<_> = parse_streaming(src).collect();
 /// assert_eq!(results.len(), 2);
 /// ```
-pub fn parse_streaming(input: &'_ str) -> impl Iterator<Item = Result<Spanned<GCodeCommand<'_>>, ParseError>> + '_ {
+pub fn parse_streaming(
+    input: &'_ str,
+) -> impl Iterator<Item = Result<Spanned<GCodeCommand<'_>>, ParseError>> + '_ {
     StreamingParser::new(input)
 }
 
@@ -95,7 +97,11 @@ struct StreamingParser<'a> {
 
 impl<'a> StreamingParser<'a> {
     fn new(src: &'a str) -> Self {
-        Self { src, pos: 0, line: 1 }
+        Self {
+            src,
+            pos: 0,
+            line: 1,
+        }
     }
 }
 
@@ -142,7 +148,9 @@ fn parse_line_inner(line: &str, line_number: u32) -> Result<GCodeCommand<'_>, Pa
 
     // ── Empty / whitespace-only ────────────────────────────────────────────
     if trimmed.is_empty() {
-        return Ok(GCodeCommand::Unknown { raw: Cow::Borrowed("") });
+        return Ok(GCodeCommand::Unknown {
+            raw: Cow::Borrowed(""),
+        });
     }
 
     // ── Parenthesised comment  ( text ) ───────────────────────────────────
@@ -374,11 +382,13 @@ fn parse_xyzef(params: &str, line_number: u32) -> Result<MoveParams, ParseError>
             continue;
         }
 
-        let value: f64 = value_str.parse().map_err(|source| ParseError::InvalidNumber {
-            line: line_number,
-            value: value_str.to_owned(),
-            source,
-        })?;
+        let value: f64 = value_str
+            .parse()
+            .map_err(|source| ParseError::InvalidNumber {
+                line: line_number,
+                value: value_str.to_owned(),
+                source,
+            })?;
 
         match letter.to_ascii_uppercase() {
             b'X' => result.x_pos = Some(value),
@@ -451,7 +461,13 @@ mod tests {
         let cmd = parse("g1 x10 y20").unwrap();
         assert!(matches!(
             cmd,
-            GCodeCommand::LinearMove { x: Some(_), y: Some(_), z: None, e: None, f: None }
+            GCodeCommand::LinearMove {
+                x: Some(_),
+                y: Some(_),
+                z: None,
+                e: None,
+                f: None
+            }
         ));
     }
 
@@ -601,13 +617,23 @@ mod tests {
     #[test]
     fn empty_line() {
         let cmd = parse("").unwrap();
-        assert_eq!(cmd, GCodeCommand::Unknown { raw: Cow::Borrowed("") });
+        assert_eq!(
+            cmd,
+            GCodeCommand::Unknown {
+                raw: Cow::Borrowed("")
+            }
+        );
     }
 
     #[test]
     fn whitespace_only_line() {
         let cmd = parse("   ").unwrap();
-        assert_eq!(cmd, GCodeCommand::Unknown { raw: Cow::Borrowed("") });
+        assert_eq!(
+            cmd,
+            GCodeCommand::Unknown {
+                raw: Cow::Borrowed("")
+            }
+        );
     }
 
     // ── Unknown / Klipper macros ──────────────────────────────────────────────
