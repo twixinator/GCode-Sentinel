@@ -13,6 +13,7 @@
 
 use crate::{
     diagnostics::{Diagnostic, PrintStats, Severity},
+    geometry::arc_span,
     models::{GCodeCommand, MachineLimits, Point3D, Spanned},
 };
 
@@ -592,35 +593,6 @@ fn handle_arc_move(
     }
 
     outputs.printer.pos = end;
-}
-
-/// Compute the absolute (positive) sweep radians from `start` to `end` in the
-/// given direction.  Result is in `[0, 2π]`.
-fn arc_span(start: f64, end: f64, clockwise: bool) -> f64 {
-    let two_pi = std::f64::consts::TAU;
-    let delta = if clockwise {
-        // CW: start → end by decreasing angle.
-        let d = start - end;
-        if d < 0.0 {
-            d + two_pi
-        } else {
-            d
-        }
-    } else {
-        // CCW: start → end by increasing angle.
-        let d = end - start;
-        if d < 0.0 {
-            d + two_pi
-        } else {
-            d
-        }
-    };
-    // Full-circle case: when start == end the span is 2π, not 0.
-    if delta < 1e-10 {
-        two_pi
-    } else {
-        delta
-    }
 }
 
 /// Returns `true` if `angle` lies within the arc swept from `start` to `end`
