@@ -26,6 +26,23 @@ use crate::geometry::arc_span;
 use crate::models::{GCodeCommand, Spanned};
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Config error type
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Errors returned by [`ArcFitConfig::validate`].
+#[derive(Debug, thiserror::Error)]
+pub enum ArcFitConfigError {
+    /// `tolerance_mm` must be strictly positive and finite.
+    #[error(
+        "ArcFitConfig: tolerance_mm must be positive and finite, got {value}"
+    )]
+    InvalidTolerance {
+        /// The invalid value that was provided.
+        value: f64,
+    },
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Public configuration types
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -64,15 +81,19 @@ impl ArcFitConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error string when `tolerance_mm` is zero, negative, NaN, or
+    /// Returns `Err` when `tolerance_mm` is zero, negative, NaN, or
     /// infinite — any value that would make the radial-deviation check
     /// mathematically meaningless.
-    pub fn validate(&self) -> Result<(), String> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArcFitConfigError::InvalidTolerance`] if the value is not
+    /// strictly positive and finite.
+    pub fn validate(&self) -> Result<(), ArcFitConfigError> {
         if !(self.tolerance_mm > 0.0 && self.tolerance_mm.is_finite()) {
-            return Err(format!(
-                "ArcFitConfig: tolerance_mm must be positive and finite, got {}",
-                self.tolerance_mm
-            ));
+            return Err(ArcFitConfigError::InvalidTolerance {
+                value: self.tolerance_mm,
+            });
         }
         Ok(())
     }
@@ -121,7 +142,7 @@ pub fn fit_arcs<'a>(
     // Validate configuration before doing any work.  An invalid tolerance makes
     // every per-point radial check meaningless (e.g. NaN comparisons always
     // produce false), so we surface it as a hard E001 error immediately.
-    if let Err(msg) = config.validate() {
+    if let Err(e) = config.validate() {
         return ArcFitResult {
             commands,
             changes: Vec::new(),
@@ -129,7 +150,7 @@ pub fn fit_arcs<'a>(
                 severity: Severity::Error,
                 line: 0,
                 code: "E001",
-                message: msg,
+                message: e.to_string(),
             }],
         };
     }
@@ -2060,9 +2081,9 @@ mod tests {
     fn test_fit_arcs_g92_e_reset_mid_sequence_arc_still_fitted() {
         // Regression test: a G92 E reset before an arc sequence must not break arc fitting.
         // With the fix, cur_e is updated to the G92 value so subsequent e_deltas are consistent.
-        // Note: extrusion_rate_consistent skips pt0.e_delta, so this test passes with or without
-        // the cur_e fix.  It will become a true RED test when task M2 is applied.  The companion
-        // test `test_fit_arcs_g92_x_reset_omitted_coord_arc_still_fitted` covers the cur_x path.
+        // Note: extrusion_rate_consistent now includes the first segment (M2 fix), so this test
+        // is a genuine regression guard.  The companion test
+        // `test_fit_arcs_g92_x_reset_omitted_coord_arc_still_fitted` covers the cur_x path.
 
         let pts = arc_points(0.0, 0.0, 10.0, 0.0, FRAC_PI_2, 4);
 
@@ -2128,9 +2149,9 @@ mod tests {
         // This is a regression test: fitting must not break when G92 appears
         // before an arc sequence.  With the fix, cur_e is correctly updated to
         // 5.0 so subsequent e_deltas are all ~1.0.  Without the fix, e_deltas
-        // are [6.0, 1.0, 1.0] but the current rate-consistency check (windows
-        // starting at pt1) still passes — this test will become a true RED
-        // test once task M2 (extrusion rate includes first segment) is applied.
+        // are [6.0, 1.0, 1.0] and with the M2 fix (first-segment rate included)
+        // the outlier entry rate is now caught, making this test a genuine RED
+        // without the cur_e fix.
         assert!(
             !result.changes.is_empty(),
             "arc after G92 E reset must be fitted"

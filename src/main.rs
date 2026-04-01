@@ -59,9 +59,8 @@ fn main() -> Result<()> {
     // Validate config before running fit_arcs so that a misconfigured tolerance
     // (zero, negative, NaN, infinite) fails fast with a clear message instead of
     // silently producing corrupt arc commands via broken float comparisons.
-    if let Err(msg) = arc_config.validate() {
-        eprintln!("error: {msg}");
-        std::process::exit(1);
+    if let Err(e) = arc_config.validate() {
+        anyhow::bail!(e);
     }
     let arc_result = fit_arcs(merge_result.commands, &arc_config);
     all_changes.extend(arc_result.changes);

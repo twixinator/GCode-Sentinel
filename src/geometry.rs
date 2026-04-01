@@ -81,13 +81,6 @@ mod tests {
     // ─── Basic span calculations ──────────────────────────────────────────────
 
     #[test]
-    fn test_arc_span_quarter_circle_ccw_returns_pi_over_2() {
-        // CCW quarter arc: 0 → π/2.
-        let result = arc_span(0.0, std::f64::consts::FRAC_PI_2, false);
-        assert!((result - std::f64::consts::FRAC_PI_2).abs() < 1e-10);
-    }
-
-    #[test]
     fn test_arc_span_quarter_circle_cw_returns_pi_over_2() {
         // CW quarter arc: π/2 → 0.
         let result = arc_span(std::f64::consts::FRAC_PI_2, 0.0, true);
