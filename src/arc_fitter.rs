@@ -499,6 +499,13 @@ fn check_arc_candidate(candidate: &[CandidatePoint], config: &ArcFitConfig) -> b
     if !candidate.iter().all(|p| p.e_delta.is_some()) {
         return false;
     }
+    // Reject sequences where E is explicitly set to 0.0 on every move.
+    // These are travel moves encoded as `E0` rather than omitting E entirely.
+    // The is_some() check above passes, but the total extrusion is zero.
+    let total_e: f64 = candidate.iter().filter_map(|p| p.e_delta).sum();
+    if total_e <= 0.0 {
+        return false;
+    }
 
     // Constraint: consistent Z (all None, or all equal).
     let first_z = candidate[0].z;
