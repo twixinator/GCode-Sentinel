@@ -390,6 +390,10 @@ fn flush_candidate<'a>(
     let first_line = start.line;
     let last_line = last.line;
 
+    // i and j are finite: computed as f64 subtraction of two finite values
+    // (circle centre from fit_circle and start position from CandidatePoint).
+    // i, j, f are always Some for synthesized arcs — centre offset and feedrate
+    // are mandatory for a well-formed G2/G3 command.
     let arc_cmd: GCodeCommand<'a> = if clockwise {
         GCodeCommand::ArcMoveCW {
             x: Some(end_x),
