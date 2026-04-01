@@ -59,6 +59,7 @@ impl Default for ArcFitConfig {
 }
 
 /// Result of the arc fitting pre-pass.
+#[derive(Debug)]
 pub struct ArcFitResult<'a> {
     /// The (possibly modified) command list.
     pub commands: Vec<Spanned<GCodeCommand<'a>>>,
