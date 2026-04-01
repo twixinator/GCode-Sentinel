@@ -569,27 +569,42 @@ fn check_arc_candidate(candidate: &[CandidatePoint], config: &ArcFitConfig) -> b
 }
 
 /// Returns `true` if the extrusion rate (`e_delta` per mm of segment length) is
-/// consistent across all consecutive segment pairs within 1% relative tolerance.
+/// consistent across **all** segments — including the first segment from
+/// `candidate[0].prev_x/prev_y` to `candidate[0].abs_x/abs_y` — within the
+/// 1% relative tolerance.
+///
+/// The previous implementation used `candidate.windows(2)`, which missed the
+/// first segment entirely.  A retraction or over-extrusion on the entry segment
+/// would pass the check undetected and produce a malformed arc.
 fn extrusion_rate_consistent(candidate: &[CandidatePoint]) -> bool {
     if candidate.len() < 2 {
         return true;
     }
 
-    // Collect (segment_length, e_delta) pairs.
-    let rates: Vec<f64> = candidate
-        .windows(2)
-        .filter_map(|w| {
-            let dx = w[1].abs_x - w[0].abs_x;
-            let dy = w[1].abs_y - w[0].abs_y;
-            let len = (dx * dx + dy * dy).sqrt();
-            let e = w[1].e_delta?;
-            if len > 1e-10 {
-                Some(e / len)
-            } else {
-                None
+    let mut rates: Vec<f64> = Vec::with_capacity(candidate.len());
+
+    // First segment: arc start (prev_x/prev_y) → candidate[0].abs_x/abs_y.
+    // This segment was previously invisible to the check.
+    let dx0 = candidate[0].abs_x - candidate[0].prev_x;
+    let dy0 = candidate[0].abs_y - candidate[0].prev_y;
+    let len0 = (dx0 * dx0 + dy0 * dy0).sqrt();
+    if len0 > 1e-10 {
+        if let Some(e) = candidate[0].e_delta {
+            rates.push(e / len0);
+        }
+    }
+
+    // Remaining segments: candidate[i-1].abs_x/abs_y → candidate[i].abs_x/abs_y.
+    for w in candidate.windows(2) {
+        let dx = w[1].abs_x - w[0].abs_x;
+        let dy = w[1].abs_y - w[0].abs_y;
+        let len = (dx * dx + dy * dy).sqrt();
+        if len > 1e-10 {
+            if let Some(e) = w[1].e_delta {
+                rates.push(e / len);
             }
-        })
-        .collect();
+        }
+    }
 
     if rates.is_empty() {
         return true;
