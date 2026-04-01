@@ -1835,4 +1835,42 @@ mod tests {
             "each arc should count as one move"
         );
     }
+
+    // ── angle_in_span wrap-around regression tests (H5) ──────────────────────
+
+    #[test]
+    fn test_angle_in_span_cw_crossing_zero_contains_angle_before_zero() {
+        // CW arc from 10° to 350°: sweeps through 0°, so 5° is inside.
+        let start = 10.0_f64.to_radians();
+        let end = 350.0_f64.to_radians();
+        let query = 5.0_f64.to_radians();
+        assert!(angle_in_span(query, start, end, true));
+    }
+
+    #[test]
+    fn test_angle_in_span_cw_crossing_zero_excludes_angle_in_gap() {
+        // CW arc from 10° to 350°: the gap is 350°→10° (the long way), so 180° is outside.
+        let start = 10.0_f64.to_radians();
+        let end = 350.0_f64.to_radians();
+        let query = 180.0_f64.to_radians();
+        assert!(!angle_in_span(query, start, end, true));
+    }
+
+    #[test]
+    fn test_angle_in_span_ccw_crossing_zero_contains_angle_after_zero() {
+        // CCW arc from 350° to 10°: sweeps through 0°, so 5° is inside.
+        let start = 350.0_f64.to_radians();
+        let end = 10.0_f64.to_radians();
+        let query = 5.0_f64.to_radians();
+        assert!(angle_in_span(query, start, end, false));
+    }
+
+    #[test]
+    fn test_angle_in_span_ccw_crossing_zero_excludes_angle_in_gap() {
+        // CCW arc from 350° to 10°: the gap is 10°→350° (the long way), so 180° is outside.
+        let start = 350.0_f64.to_radians();
+        let end = 10.0_f64.to_radians();
+        let query = 180.0_f64.to_radians();
+        assert!(!angle_in_span(query, start, end, false));
+    }
 }
