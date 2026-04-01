@@ -82,6 +82,9 @@ pub struct ArcFitResult<'a> {
 ///
 /// Does not panic on any input.
 #[must_use]
+// Single-pass over the command list with several pieces of mutable state.
+// Extracting sub-phases would thread all state through helper signatures,
+// increasing coupling without reducing observable complexity.
 #[allow(clippy::too_many_lines)]
 pub fn fit_arcs<'a>(
     commands: Vec<Spanned<GCodeCommand<'a>>>,
