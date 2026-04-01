@@ -9,6 +9,7 @@ use memmap2::Mmap;
 use tracing::{info, warn};
 
 use gcode_sentinel::analyzer::analyze;
+use gcode_sentinel::arc_fitter::{fit_arcs, ArcFitConfig, DEFAULT_ARC_TOLERANCE_MM};
 use gcode_sentinel::cli::{Cli, ReportFormat};
 use gcode_sentinel::diagnostics::{AnalysisReport, OptimizationChange, Severity, ValidationDiff};
 use gcode_sentinel::emitter::{emit, EmitConfig};
@@ -50,8 +51,22 @@ fn main() -> Result<()> {
     let merge_result = gcode_sentinel::optimizer::merge_collinear(commands, &opt_config);
     let mut all_changes = merge_result.changes;
 
+    // Pre-pass: arc fitting (opt-in).
+    let arc_config = ArcFitConfig {
+        enabled: cli.arc_fit,
+        tolerance_mm: cli.arc_tolerance.unwrap_or(DEFAULT_ARC_TOLERANCE_MM),
+    };
+    // Validate config before running fit_arcs so that a misconfigured tolerance
+    // (zero, negative, NaN, infinite) fails fast with a clear message instead of
+    // silently producing corrupt arc commands via broken float comparisons.
+    if let Err(e) = arc_config.validate() {
+        anyhow::bail!(e);
+    }
+    let arc_result = fit_arcs(merge_result.commands, &arc_config);
+    all_changes.extend(arc_result.changes);
+
     // Main optimizer pass.
-    let opt_result = optimize(merge_result.commands, &opt_config);
+    let opt_result = optimize(arc_result.commands, &opt_config);
     all_changes.extend(opt_result.changes);
     log_optimization(all_changes.len(), effective_dry_run);
 
@@ -84,6 +99,8 @@ fn main() -> Result<()> {
 
     let mut report = build_report(post_analysis, all_changes, effective_dry_run);
 
+    // Add arc fitting diagnostics (e.g. W004 firmware warning).
+    report.diagnostics.extend(arc_result.diagnostics);
     // Add progress insertion diagnostics.
     report.diagnostics.extend(progress_result.diagnostics);
 

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking changes
+
+- `gcode_sentinel::arc_fitter::arc_span` is no longer part of the public API.
+  The function has been moved to the internal `geometry` module
+  (`pub(crate)`) as part of the H2 deduplication. Downstream code that
+  called `arc_span` directly must be updated to replicate the logic locally.
+
 ## [0.2.1] - 2026-03-31
 
 ### Fixed

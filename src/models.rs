@@ -63,6 +63,48 @@ pub enum GCodeCommand<'a> {
         f: Option<f64>,
     },
 
+    /// `G2` — clockwise arc move.
+    ///
+    /// Centre offset (I, J) is relative to the arc start point.
+    /// Any subset of target axes may be present.
+    ArcMoveCW {
+        /// Target X coordinate in millimetres, if specified.
+        x: Option<f64>,
+        /// Target Y coordinate in millimetres, if specified.
+        y: Option<f64>,
+        /// Target Z coordinate in millimetres, if specified.
+        z: Option<f64>,
+        /// Extruder axis position/delta in millimetres, if specified.
+        e: Option<f64>,
+        /// Feed-rate in mm/min, if specified.
+        f: Option<f64>,
+        /// X offset from current position to arc centre, if specified.
+        i: Option<f64>,
+        /// Y offset from current position to arc centre, if specified.
+        j: Option<f64>,
+    },
+
+    /// `G3` — counter-clockwise arc move.
+    ///
+    /// Centre offset (I, J) is relative to the arc start point.
+    /// Any subset of target axes may be present.
+    ArcMoveCCW {
+        /// Target X coordinate in millimetres, if specified.
+        x: Option<f64>,
+        /// Target Y coordinate in millimetres, if specified.
+        y: Option<f64>,
+        /// Target Z coordinate in millimetres, if specified.
+        z: Option<f64>,
+        /// Extruder axis position/delta in millimetres, if specified.
+        e: Option<f64>,
+        /// Feed-rate in mm/min, if specified.
+        f: Option<f64>,
+        /// X offset from current position to arc centre, if specified.
+        i: Option<f64>,
+        /// Y offset from current position to arc centre, if specified.
+        j: Option<f64>,
+    },
+
     /// `G90` — set positioning to absolute mode.
     SetAbsolute,
 

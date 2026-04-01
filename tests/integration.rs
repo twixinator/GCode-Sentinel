@@ -7,9 +7,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use gcode_sentinel::analyzer::analyze;
+use gcode_sentinel::arc_fitter::{fit_arcs, ArcFitConfig};
 use gcode_sentinel::diagnostics::{AnalysisReport, Severity, ValidationDiff};
 use gcode_sentinel::emitter::{emit, EmitConfig};
-use gcode_sentinel::models::MachineLimits;
+use gcode_sentinel::models::{GCodeCommand, MachineLimits};
 use gcode_sentinel::optimizer::{insert_progress_markers, merge_collinear, optimize, OptConfig};
 use gcode_sentinel::parser::parse_all;
 
@@ -478,6 +479,221 @@ fn feedrate_stripping_preserves_analysis() {
         assert_eq!(
             pre.stats.layer_count, post.stats.layer_count,
             "{name}: feedrate stripping must preserve layer count"
+        );
+    }
+}
+
+// ── Arc fitting (v2.2) ───────────────────────────────────────────────────────
+
+/// Enabled arc fitting on the quarter-circle fixture must produce at least one
+/// G2/G3 command and preserve total extrusion within 0.1 mm.
+#[test]
+fn arc_fit_full_pipeline_obvious_arcs() {
+    let text = fs::read_to_string(fixture("arc_quarter_circles.gcode"))
+        .expect("fixture arc_quarter_circles.gcode must exist");
+    let cmds = parse_all(&text).expect("must parse");
+
+    let pre = analyze(cmds.iter(), None);
+    let config = ArcFitConfig {
+        enabled: true,
+        tolerance_mm: 0.05,
+    };
+    let result = fit_arcs(cmds, &config);
+
+    let arc_count = result
+        .commands
+        .iter()
+        .filter(|c| {
+            matches!(
+                &c.inner,
+                GCodeCommand::ArcMoveCW { .. } | GCodeCommand::ArcMoveCCW { .. }
+            )
+        })
+        .count();
+    assert!(
+        arc_count >= 1,
+        "expected at least one G2/G3 arc in the quarter-circle fixture, got {arc_count}"
+    );
+    assert!(
+        !result.changes.is_empty(),
+        "arc fitting must report at least one change"
+    );
+
+    let post = analyze(result.commands.iter(), None);
+    assert!(
+        (pre.stats.total_filament_mm - post.stats.total_filament_mm).abs() < 0.1,
+        "arc fitting must preserve extrusion within 0.1 mm: pre={} post={}",
+        pre.stats.total_filament_mm,
+        post.stats.total_filament_mm,
+    );
+}
+
+/// With arc fitting disabled, the command list is returned unchanged and the
+/// emitted bytes must be identical to a straight parse → emit of the same file.
+#[test]
+fn arc_fit_disabled_passthrough() {
+    let text = fs::read_to_string(fixture("arc_quarter_circles.gcode"))
+        .expect("fixture arc_quarter_circles.gcode must exist");
+    let cmds_a = parse_all(&text).expect("must parse (a)");
+    let cmds_b = parse_all(&text).expect("must parse (b)");
+
+    let disabled = ArcFitConfig {
+        enabled: false,
+        tolerance_mm: 0.02,
+    };
+    let result = fit_arcs(cmds_a, &disabled);
+
+    assert!(
+        result.changes.is_empty(),
+        "disabled arc fitting must produce zero changes"
+    );
+    assert!(
+        result.diagnostics.is_empty(),
+        "disabled arc fitting must produce zero diagnostics"
+    );
+
+    let mut buf_original = Vec::new();
+    emit(&cmds_b, &mut buf_original, &EmitConfig::default()).expect("emit original");
+
+    let mut buf_passthrough = Vec::new();
+    emit(
+        &result.commands,
+        &mut buf_passthrough,
+        &EmitConfig::default(),
+    )
+    .expect("emit passthrough");
+
+    assert_eq!(
+        buf_original, buf_passthrough,
+        "disabled arc fitting must not alter emitted output"
+    );
+}
+
+/// The quarter-circle fixture has no slicer header comment.  Arc fitting must
+/// produce at least one arc change, and W004 must appear exactly once.
+#[test]
+fn arc_fit_w004_warning_unknown_firmware() {
+    let text = fs::read_to_string(fixture("arc_quarter_circles.gcode"))
+        .expect("fixture arc_quarter_circles.gcode must exist");
+    let cmds = parse_all(&text).expect("must parse");
+
+    let config = ArcFitConfig {
+        enabled: true,
+        tolerance_mm: 0.05,
+    };
+    let result = fit_arcs(cmds, &config);
+
+    assert!(
+        !result.changes.is_empty(),
+        "expected arc fitting to produce at least one change on arc_quarter_circles.gcode"
+    );
+    let w004_count = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "W004")
+        .count();
+    assert_eq!(
+        w004_count, 1,
+        "expected exactly one W004 warning for unknown firmware, got {w004_count}"
+    );
+}
+
+/// Running the collinear-merge pass followed by arc fitting on the combined
+/// fixture must not introduce any validation regressions.
+#[test]
+fn arc_fit_combined_with_collinear_merge() {
+    let text = fs::read_to_string(fixture("arc_with_collinear_prefix.gcode"))
+        .expect("fixture arc_with_collinear_prefix.gcode must exist");
+    let cmds = parse_all(&text).expect("must parse");
+
+    let pre = analyze(cmds.iter(), None);
+
+    let opt_config = OptConfig {
+        dry_run: false,
+        merge_collinear: true,
+        ..Default::default()
+    };
+    let merged = merge_collinear(cmds, &opt_config);
+
+    let arc_config = ArcFitConfig {
+        enabled: true,
+        tolerance_mm: 0.05,
+    };
+    let fitted = fit_arcs(merged.commands, &arc_config);
+
+    let post = analyze(fitted.commands.iter(), None);
+    let diff = ValidationDiff::compute(&pre.diagnostics, &post.diagnostics);
+
+    assert!(
+        !diff.regression_detected,
+        "collinear merge + arc fitting must not introduce regressions: {:?}",
+        diff.new_errors
+    );
+    assert!(
+        (pre.stats.total_filament_mm - post.stats.total_filament_mm).abs() < 0.1,
+        "combined passes must preserve extrusion within 0.1 mm: pre={} post={}",
+        pre.stats.total_filament_mm,
+        post.stats.total_filament_mm,
+    );
+}
+
+/// Running arc fitting twice on already-fitted output must produce no further
+/// changes (idempotence: G2/G3 commands are not LinearMove, so the sliding
+/// window skips them entirely on the second pass).
+#[test]
+fn arc_fit_idempotent() {
+    let text = fs::read_to_string(fixture("arc_quarter_circles.gcode"))
+        .expect("fixture arc_quarter_circles.gcode must exist");
+    let cmds = parse_all(&text).expect("must parse");
+
+    let config = ArcFitConfig {
+        enabled: true,
+        tolerance_mm: 0.05,
+    };
+    let pass1 = fit_arcs(cmds, &config);
+
+    // Second pass on already-converted commands.
+    let pass2 = fit_arcs(pass1.commands, &config);
+
+    assert_eq!(
+        pass2.changes.len(),
+        0,
+        "second arc-fitting pass must produce zero changes (idempotent)"
+    );
+}
+
+/// Arc fitting must not alter total extrusion when run on the existing real
+/// fixtures (malm_slide, rose) which contain no arc-approximation sequences.
+/// This guards against the pass accidentally corrupting non-arc G-Code.
+#[test]
+fn arc_fit_preserves_extrusion_on_existing_fixtures() {
+    for name in &["malm_slide.gcode", "rose.gcode"] {
+        let text = fs::read_to_string(fixture(name))
+            .unwrap_or_else(|_| panic!("fixture {name} must exist"));
+        let cmds = parse_all(&text).unwrap_or_else(|_| panic!("{name} must parse"));
+
+        let pre = analyze(cmds.iter(), None);
+
+        let config = ArcFitConfig {
+            enabled: true,
+            tolerance_mm: 0.02,
+        };
+        let result = fit_arcs(cmds, &config);
+
+        let post = analyze(result.commands.iter(), None);
+
+        assert!(
+            (pre.stats.total_filament_mm - post.stats.total_filament_mm).abs() < 1e-6,
+            "{name}: arc fitting must not alter total extrusion: pre={} post={}",
+            pre.stats.total_filament_mm,
+            post.stats.total_filament_mm,
+        );
+
+        let diff = ValidationDiff::compute(&pre.diagnostics, &post.diagnostics);
+        assert!(
+            !diff.regression_detected,
+            "{name}: arc fitting must not introduce diagnostic regressions: {:?}",
+            diff.new_errors
         );
     }
 }

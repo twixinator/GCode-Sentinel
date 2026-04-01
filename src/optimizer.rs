@@ -1247,7 +1247,9 @@ impl PassState {
                     feed: *f,
                 });
             }
-            GCodeCommand::LinearMove { x, y, z, e, f } => {
+            GCodeCommand::LinearMove { x, y, z, e, f }
+            | GCodeCommand::ArcMoveCW { x, y, z, e, f, .. }
+            | GCodeCommand::ArcMoveCCW { x, y, z, e, f, .. } => {
                 self.apply_move(MoveAxes {
                     x_pos: *x,
                     y_pos: *y,
@@ -1284,14 +1286,16 @@ impl PassState {
         // Track modal feedrate for Rule 8.
         match cmd {
             GCodeCommand::RapidMove { f: Some(val), .. }
-            | GCodeCommand::LinearMove { f: Some(val), .. } => {
+            | GCodeCommand::LinearMove { f: Some(val), .. }
+            | GCodeCommand::ArcMoveCW { f: Some(val), .. }
+            | GCodeCommand::ArcMoveCCW { f: Some(val), .. } => {
                 self.modal_feedrate = Some(*val);
             }
             _ => {}
         }
     }
 
-    /// Apply a G0/G1 move to the tracked position.
+    /// Apply a linear or arc move to the tracked position.
     fn apply_move(&mut self, axes: MoveAxes) {
         if self.pos.is_absolute {
             if let Some(v) = axes.x_pos {
@@ -2361,6 +2365,102 @@ mod tests {
         assert!(
             m73s.len() >= 1,
             "should insert M73 at Z-based layer boundaries"
+        );
+    }
+
+    // ── C1: Arc position / feedrate tracking ─────────────────────────────────
+
+    /// Rule 4 fires on a LinearMove that is zero-delta only when the preceding
+    /// ArcMoveCCW has advanced the tracked position to the same endpoint.
+    /// Before the fix, PassState::update ignores arc commands, so the position
+    /// is still (0,0) after the arc, and the subsequent G1 to (10,10) is NOT
+    /// flagged — producing zero changes instead of one.
+    #[test]
+    fn test_optimize_arc_move_advances_position_for_rule4() {
+        let cmds = vec![
+            spanned(
+                GCodeCommand::ArcMoveCCW {
+                    x: Some(10.0),
+                    y: Some(10.0),
+                    z: None,
+                    e: None,
+                    f: None,
+                    i: Some(-10.0),
+                    j: Some(0.0),
+                },
+                1,
+            ),
+            spanned(
+                GCodeCommand::LinearMove {
+                    x: Some(10.0),
+                    y: Some(10.0),
+                    z: None,
+                    e: None,
+                    f: None,
+                },
+                2,
+            ),
+        ];
+        let result = optimize(cmds, &OptConfig::default());
+        assert_eq!(
+            result.changes.len(),
+            1,
+            "Rule 4 must flag the zero-delta LinearMove after the arc; got {} changes",
+            result.changes.len()
+        );
+        assert_eq!(
+            result.commands.len(),
+            1,
+            "zero-delta LinearMove must be removed; {} commands remain",
+            result.commands.len()
+        );
+    }
+
+    /// Rule 8 strips a redundant feedrate from a LinearMove when the modal
+    /// feedrate was last set by an arc command.  Before the fix, arcs do not
+    /// update modal_feedrate, so the F on the subsequent G1 is never stripped.
+    #[test]
+    fn test_optimize_arc_move_updates_modal_feedrate_for_rule8() {
+        let cmds = vec![
+            spanned(
+                GCodeCommand::ArcMoveCW {
+                    x: Some(5.0),
+                    y: Some(0.0),
+                    z: None,
+                    e: None,
+                    f: Some(3000.0),
+                    i: Some(-5.0),
+                    j: Some(0.0),
+                },
+                1,
+            ),
+            spanned(
+                GCodeCommand::LinearMove {
+                    x: Some(10.0),
+                    y: Some(0.0),
+                    z: None,
+                    e: None,
+                    f: Some(3000.0),
+                },
+                2,
+            ),
+        ];
+        let result = optimize(cmds, &OptConfig::default());
+        assert_eq!(
+            result.changes.len(),
+            1,
+            "Rule 8 must strip the redundant F from the LinearMove; got {} changes",
+            result.changes.len()
+        );
+        // The LinearMove should still be present but with f stripped to None.
+        let linear = result
+            .commands
+            .iter()
+            .find(|c| matches!(&c.inner, GCodeCommand::LinearMove { .. }))
+            .expect("LinearMove must survive in the output");
+        assert!(
+            matches!(&linear.inner, GCodeCommand::LinearMove { f: None, .. }),
+            "LinearMove feedrate must be stripped to None by Rule 8"
         );
     }
 }
