@@ -2587,4 +2587,69 @@ mod tests {
             "explicit E=0 on all moves must not be fitted as an arc"
         );
     }
+
+    // ─── M2: First-segment extrusion rate consistency ─────────────────────────
+
+    /// Three-point arc where the first G1 carries 2× the extrusion rate of the
+    /// subsequent two moves.
+    ///
+    /// The first segment runs from the arc start position (`prev_x/prev_y` of
+    /// `candidate[0]`) to `candidate[0].abs_x/abs_y`.  The current
+    /// `extrusion_rate_consistent` only examines `candidate.windows(2)`,
+    /// completely skipping that segment — so the outlier first-segment rate is
+    /// invisible and the arc is (incorrectly) accepted.
+    ///
+    /// After the M2 fix the first segment is included in the rate calculation
+    /// and the 2× discrepancy causes the check to return `false`.
+    #[test]
+    fn test_extrusion_rate_consistent_first_segment_outlier_rate_rejected() {
+        // CCW quarter-circle: centre (0,0), r=10, 4 equally spaced points.
+        // pts[0] is the arc start (emitted as G0).
+        // Segments: pts[0]→pts[1] (first G1), pts[1]→pts[2], pts[2]→pts[3].
+        let pts = arc_points(0.0, 0.0, 10.0, 0.0, FRAC_PI_2, 4);
+
+        let normal_rate = 0.05_f64;
+        let outlier_rate = normal_rate * 2.0; // 2× — well beyond the 1% tolerance
+
+        let mut cmds: Vec<Spanned<GCodeCommand<'static>>> = Vec::new();
+        // G0 to arc start — fitter sets cur_x/cur_y = pts[0].
+        cmds.push(sp(
+            GCodeCommand::RapidMove {
+                x: Some(pts[0].0),
+                y: Some(pts[0].1),
+                z: None,
+                f: Some(9000.0),
+            },
+            1,
+        ));
+
+        // Build 3 G1 moves manually so we can set the first at outlier_rate.
+        let mut e = 0.0_f64;
+        for (i, &(x, y)) in pts.iter().enumerate() {
+            if i == 0 {
+                continue;
+            }
+            let (px, py) = pts[i - 1];
+            let seg_len = ((x - px).powi(2) + (y - py).powi(2)).sqrt();
+            // First G1 (i==1): outlier extrusion rate.  Subsequent: normal.
+            let rate = if i == 1 { outlier_rate } else { normal_rate };
+            e += seg_len * rate;
+            cmds.push(sp(
+                GCodeCommand::LinearMove {
+                    x: Some(x),
+                    y: Some(y),
+                    z: None,
+                    e: Some(e),
+                    f: if i == 1 { Some(3000.0) } else { None },
+                },
+                (i + 1) as u32,
+            ));
+        }
+
+        let result = fit_arcs(cmds, &enabled_config());
+        assert!(
+            result.changes.is_empty(),
+            "arc with 2× extrusion rate on first segment must be rejected (first segment included after M2 fix)"
+        );
+    }
 }
