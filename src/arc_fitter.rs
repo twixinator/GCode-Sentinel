@@ -19,9 +19,10 @@
 
 #![warn(clippy::pedantic)]
 
-use std::f64::consts::{PI, TAU};
+use std::f64::consts::PI;
 
 use crate::diagnostics::{Diagnostic, OptimizationChange, Severity};
+use crate::geometry::arc_span;
 use crate::models::{GCodeCommand, Spanned};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -761,33 +762,6 @@ fn is_clockwise(points: &[(f64, f64)], cx: f64, cy: f64) -> bool {
         sum += ax * by - ay * bx;
     }
     sum < 0.0
-}
-
-/// Compute the absolute (positive) arc sweep in radians from `start` to `end`
-/// in the given direction.  Result is in `(0, 2π]`.
-#[must_use]
-pub fn arc_span(start: f64, end: f64, clockwise: bool) -> f64 {
-    let delta = if clockwise {
-        let d = start - end;
-        if d <= 0.0 {
-            d + TAU
-        } else {
-            d
-        }
-    } else {
-        let d = end - start;
-        if d <= 0.0 {
-            d + TAU
-        } else {
-            d
-        }
-    };
-    // Exact coincidence of start and end means a full circle.
-    if delta < 1e-10 {
-        TAU
-    } else {
-        delta
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2559,6 +2533,51 @@ mod tests {
         assert!(
             w004,
             "expected W004 diagnostic for Cura firmware (arc support requires Arc Welder plugin)"
+        );
+    }
+
+    // ─── M1: Zero-extrusion explicit-E travel ────────────────────────────────
+
+    /// Quarter-arc geometry where every G1 carries `e: Some(0.0)`.
+    ///
+    /// The `e_delta.is_some()` check passes for all points (the field is
+    /// present), but the total extrusion is zero — this is a travel move
+    /// encoded as `E0` on every segment, not a printing arc.  The fitter
+    /// must reject it.
+    #[test]
+    fn test_fit_arcs_explicit_zero_extrusion_not_fitted() {
+        let pts = arc_points(0.0, 0.0, 10.0, 0.0, FRAC_PI_2, 5);
+        let mut cmds: Vec<Spanned<GCodeCommand<'static>>> = Vec::new();
+        cmds.push(sp(
+            GCodeCommand::RapidMove {
+                x: Some(pts[0].0),
+                y: Some(pts[0].1),
+                z: None,
+                f: Some(9000.0),
+            },
+            1,
+        ));
+        // Every move has e: Some(0.0) — explicit zero, not absent.
+        for (i, &(x, y)) in pts.iter().enumerate() {
+            if i == 0 {
+                continue;
+            }
+            cmds.push(sp(
+                GCodeCommand::LinearMove {
+                    x: Some(x),
+                    y: Some(y),
+                    z: None,
+                    e: Some(0.0),
+                    f: if i == 1 { Some(3000.0) } else { None },
+                },
+                (i + 1) as u32,
+            ));
+        }
+
+        let result = fit_arcs(cmds, &enabled_config());
+        assert!(
+            result.changes.is_empty(),
+            "explicit E=0 on all moves must not be fitted as an arc"
         );
     }
 }
