@@ -138,7 +138,14 @@ pub fn fit_arcs<'a>(
             if let Some(fv) = f {
                 modal_feedrate = Some(*fv);
             }
-            let effective_feedrate = modal_feedrate.unwrap_or(1_500.0);
+            let effective_feedrate = modal_feedrate.unwrap_or_else(|| {
+                tracing::debug!(
+                    line = spanned.line,
+                    fallback_mm_per_min = 1_500.0_f64,
+                    "arc_fitter: no modal feedrate established; using fallback"
+                );
+                1_500.0
+            });
 
             // Resolve absolute position.
             let abs_x = x.unwrap_or(cur_x);
@@ -226,7 +233,17 @@ pub fn fit_arcs<'a>(
             FirmwareFlavour::Repetier => "Repetier",
             FirmwareFlavour::BFB => "BFB",
             FirmwareFlavour::Makerbot => "MAKERBOT",
-            _ => "unknown",
+            FirmwareFlavour::Cura => "Cura (Arc Welder plugin required)",
+            FirmwareFlavour::Unknown => "unknown",
+            // The variants below support arcs and should not reach this branch,
+            // but exhaustiveness requires we cover them.
+            FirmwareFlavour::Marlin
+            | FirmwareFlavour::Klipper
+            | FirmwareFlavour::Smoothieware
+            | FirmwareFlavour::PrusaSlicer
+            | FirmwareFlavour::OrcaSlicer
+            | FirmwareFlavour::Simplify3D
+            | FirmwareFlavour::IdeaMaker => "unknown",
         };
         diagnostics.push(Diagnostic {
             severity: Severity::Warning,
@@ -792,6 +809,9 @@ pub enum FirmwareFlavour {
 }
 
 /// Returns `true` when the firmware is known to support G2/G3 arc moves.
+///
+/// Cura is intentionally excluded: it requires the Arc Welder plugin for G2/G3
+/// support and does not enable arcs by default.
 #[must_use]
 pub fn firmware_supports_arcs(flavour: &FirmwareFlavour) -> bool {
     matches!(
@@ -801,7 +821,6 @@ pub fn firmware_supports_arcs(flavour: &FirmwareFlavour) -> bool {
             | FirmwareFlavour::Smoothieware
             | FirmwareFlavour::PrusaSlicer
             | FirmwareFlavour::OrcaSlicer
-            | FirmwareFlavour::Cura
             | FirmwareFlavour::Simplify3D
             | FirmwareFlavour::IdeaMaker
     )
@@ -2421,5 +2440,110 @@ mod tests {
         let result = fit_arcs(cmds, &enabled_config());
         let w004 = result.diagnostics.iter().any(|d| d.code == "W004");
         assert!(!w004, "W004 should NOT be emitted for OrcaSlicer");
+    }
+
+    // ─── Feedrate fallback ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fit_arcs_no_prior_feedrate_uses_fallback_and_produces_arc() {
+        // Arc sequence with NO F on any move — effective_feedrate falls back to
+        // 1 500 mm/min.  The fitter must still produce an arc and the synthesised
+        // arc must carry f: Some(1500.0).
+        let pts = arc_points(0.0, 0.0, 10.0, 0.0, FRAC_PI_2, 5);
+        let mut cmds: Vec<Spanned<GCodeCommand<'static>>> = Vec::new();
+        cmds.push(sp(
+            GCodeCommand::RapidMove {
+                x: Some(pts[0].0),
+                y: Some(pts[0].1),
+                z: None,
+                f: None,
+            },
+            1,
+        ));
+        // Build G1 moves without F on any of them.
+        let mut e = 0.0_f64;
+        for (i, &(x, y)) in pts.iter().enumerate() {
+            if i == 0 {
+                continue;
+            }
+            let (px, py) = pts[i - 1];
+            let seg = ((x - px).powi(2) + (y - py).powi(2)).sqrt();
+            e += seg * 0.05;
+            cmds.push(sp(
+                GCodeCommand::LinearMove {
+                    x: Some(x),
+                    y: Some(y),
+                    z: None,
+                    e: Some(e),
+                    f: None, // no feedrate anywhere
+                },
+                (i + 1) as u32,
+            ));
+        }
+
+        let result = fit_arcs(cmds, &enabled_config());
+
+        // An arc must be produced.
+        assert!(
+            !result.changes.is_empty(),
+            "arc must be fitted even when no feedrate is present"
+        );
+
+        // The synthesised arc must use the 1500 mm/min fallback feedrate.
+        let arc = result
+            .commands
+            .iter()
+            .find(|c| {
+                matches!(
+                    c.inner,
+                    GCodeCommand::ArcMoveCW { .. } | GCodeCommand::ArcMoveCCW { .. }
+                )
+            })
+            .expect("expected a fitted arc command");
+
+        let arc_f = match &arc.inner {
+            GCodeCommand::ArcMoveCW { f, .. } | GCodeCommand::ArcMoveCCW { f, .. } => *f,
+            _ => panic!("not an arc command"),
+        };
+        assert_eq!(
+            arc_f,
+            Some(1_500.0),
+            "fallback feedrate must be 1500 mm/min, got {arc_f:?}"
+        );
+    }
+
+    #[test]
+    fn test_fit_arcs_cura_firmware_emits_w004() {
+        use std::borrow::Cow;
+        let pts = arc_points(0.0, 0.0, 10.0, 0.0, FRAC_PI_2, 5);
+        let mut cmds: Vec<Spanned<GCodeCommand<'static>>> = Vec::new();
+        // Cura slicer header — detect_firmware will return FirmwareFlavour::Cura.
+        cmds.push(sp(
+            GCodeCommand::Comment {
+                text: Cow::Borrowed("Generated with Cura_SteamEngine 5.7.0"),
+            },
+            1,
+        ));
+        cmds.push(sp(
+            GCodeCommand::RapidMove {
+                x: Some(pts[0].0),
+                y: Some(pts[0].1),
+                z: None,
+                f: None,
+            },
+            2,
+        ));
+        cmds.extend(arc_g1_cmds(&pts, 3000.0, 0.05, 0.0));
+
+        let result = fit_arcs(cmds, &enabled_config());
+        assert!(
+            !result.changes.is_empty(),
+            "expected arc fitting to produce at least one change"
+        );
+        let w004 = result.diagnostics.iter().any(|d| d.code == "W004");
+        assert!(
+            w004,
+            "expected W004 diagnostic for Cura firmware (arc support requires Arc Welder plugin)"
+        );
     }
 }
