@@ -100,4 +100,45 @@ mod tests {
         let result = arc_span(0.0, std::f64::consts::PI, false);
         assert!((result - std::f64::consts::PI).abs() < 1e-10);
     }
+
+    // ─── M4: wrap-around and full-circle arithmetic ───────────────────────────
+
+    #[test]
+    fn test_arc_span_cw_crossing_zero_returns_correct_radians() {
+        // CW arc from 10° to 350°: sweeps through 0°, span = 20°.
+        let start = 10.0_f64.to_radians();
+        let end = 350.0_f64.to_radians();
+        let expected = 20.0_f64.to_radians();
+        assert!((arc_span(start, end, true) - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_arc_span_ccw_crossing_zero_returns_correct_radians() {
+        // CCW arc from 350° to 10°: sweeps through 0°, span = 20°.
+        let start = 350.0_f64.to_radians();
+        let end = 10.0_f64.to_radians();
+        let expected = 20.0_f64.to_radians();
+        assert!((arc_span(start, end, false) - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_arc_span_full_circle_cw_returns_tau() {
+        // CW full circle: start == end → TAU.
+        let angle = std::f64::consts::PI;
+        assert_eq!(arc_span(angle, angle, true), TAU);
+    }
+
+    #[test]
+    fn test_arc_span_full_circle_ccw_returns_tau() {
+        // CCW full circle: start == end → TAU.
+        let angle = std::f64::consts::PI;
+        assert_eq!(arc_span(angle, angle, false), TAU);
+    }
+
+    #[test]
+    fn test_arc_span_standard_quarter_ccw_returns_half_pi() {
+        // CCW quarter arc: 0° → 90°, span = π/2.
+        let result = arc_span(0.0, std::f64::consts::FRAC_PI_2, false);
+        assert!((result - std::f64::consts::FRAC_PI_2).abs() < 1e-10);
+    }
 }
