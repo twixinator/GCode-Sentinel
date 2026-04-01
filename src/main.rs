@@ -56,6 +56,13 @@ fn main() -> Result<()> {
         enabled: cli.arc_fit,
         tolerance_mm: cli.arc_tolerance.unwrap_or(DEFAULT_ARC_TOLERANCE_MM),
     };
+    // Validate config before running fit_arcs so that a misconfigured tolerance
+    // (zero, negative, NaN, infinite) fails fast with a clear message instead of
+    // silently producing corrupt arc commands via broken float comparisons.
+    if let Err(msg) = arc_config.validate() {
+        eprintln!("error: {msg}");
+        std::process::exit(1);
+    }
     let arc_result = fit_arcs(merge_result.commands, &arc_config);
     all_changes.extend(arc_result.changes);
 
