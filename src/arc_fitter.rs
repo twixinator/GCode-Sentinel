@@ -57,6 +57,10 @@ const MAX_RADIUS_MM: f64 = 1_000.0;
 const MIN_SPAN_RAD: f64 = 15.0 * PI / 180.0; // 15°
 /// Extrusion-rate relative tolerance (fraction, e.g. 0.01 = 1%).
 const EXTRUSION_RATE_TOLERANCE: f64 = 0.01;
+/// Feedrate (mm/min) used when no modal feedrate has been established yet.
+///
+/// 1 500 mm/min is a conservative default for typical FDM printing speeds.
+const FALLBACK_FEEDRATE_MM_PER_MIN: f64 = 1_500.0;
 
 /// Configuration for the arc fitting pre-pass.
 #[derive(Debug, Clone)]
@@ -202,10 +206,10 @@ pub fn fit_arcs<'a>(
             let effective_feedrate = modal_feedrate.unwrap_or_else(|| {
                 tracing::debug!(
                     line = spanned.line,
-                    fallback_mm_per_min = 1_500.0_f64,
+                    fallback_mm_per_min = FALLBACK_FEEDRATE_MM_PER_MIN,
                     "arc_fitter: no modal feedrate established; using fallback"
                 );
-                1_500.0
+                FALLBACK_FEEDRATE_MM_PER_MIN
             });
 
             // Resolve absolute position.
@@ -2574,8 +2578,8 @@ mod tests {
         };
         assert_eq!(
             arc_f,
-            Some(1_500.0),
-            "fallback feedrate must be 1500 mm/min, got {arc_f:?}"
+            Some(FALLBACK_FEEDRATE_MM_PER_MIN),
+            "fallback feedrate must be {FALLBACK_FEEDRATE_MM_PER_MIN} mm/min, got {arc_f:?}"
         );
     }
 
