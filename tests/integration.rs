@@ -569,8 +569,8 @@ fn arc_fit_disabled_passthrough() {
     );
 }
 
-/// The quarter-circle fixture has no slicer header comment.  When arc fitting
-/// produces at least one arc, W004 must appear in the diagnostics.
+/// The quarter-circle fixture has no slicer header comment.  Arc fitting must
+/// produce at least one arc change, and W004 must appear exactly once.
 #[test]
 fn arc_fit_w004_warning_unknown_firmware() {
     let text = fs::read_to_string(fixture("arc_quarter_circles.gcode"))
@@ -583,18 +583,19 @@ fn arc_fit_w004_warning_unknown_firmware() {
     };
     let result = fit_arcs(cmds, &config);
 
-    // Only emit W004 when at least one arc was produced.
-    if !result.changes.is_empty() {
-        let w004_count = result
-            .diagnostics
-            .iter()
-            .filter(|d| d.code == "W004")
-            .count();
-        assert_eq!(
-            w004_count, 1,
-            "expected exactly one W004 warning for unknown firmware, got {w004_count}"
-        );
-    }
+    assert!(
+        !result.changes.is_empty(),
+        "expected arc fitting to produce at least one change on arc_quarter_circles.gcode"
+    );
+    let w004_count = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "W004")
+        .count();
+    assert_eq!(
+        w004_count, 1,
+        "expected exactly one W004 warning for unknown firmware, got {w004_count}"
+    );
 }
 
 /// Running the collinear-merge pass followed by arc fitting on the combined
