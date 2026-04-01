@@ -2558,6 +2558,60 @@ mod tests {
         );
     }
 
+    // ─── T2: ArcFitConfig::validate ──────────────────────────────────────────
+
+    #[test]
+    fn test_arc_fit_config_validate_zero_tolerance_returns_error() {
+        let cfg = ArcFitConfig {
+            enabled: true,
+            tolerance_mm: 0.0,
+        };
+        assert!(cfg.validate().is_err(), "zero tolerance must return Err");
+    }
+
+    #[test]
+    fn test_arc_fit_config_validate_negative_tolerance_returns_error() {
+        let cfg = ArcFitConfig {
+            enabled: true,
+            tolerance_mm: -1.0,
+        };
+        assert!(cfg.validate().is_err(), "negative tolerance must return Err");
+    }
+
+    #[test]
+    fn test_arc_fit_config_validate_nan_tolerance_returns_error() {
+        let cfg = ArcFitConfig {
+            enabled: true,
+            tolerance_mm: f64::NAN,
+        };
+        assert!(cfg.validate().is_err(), "NaN tolerance must return Err");
+    }
+
+    #[test]
+    fn test_arc_fit_config_validate_infinite_tolerance_returns_error() {
+        let cfg = ArcFitConfig {
+            enabled: true,
+            tolerance_mm: f64::INFINITY,
+        };
+        assert!(
+            cfg.validate().is_err(),
+            "infinite tolerance must return Err"
+        );
+    }
+
+    #[test]
+    fn test_arc_fit_config_validate_valid_tolerance_returns_ok() {
+        let cfg = ArcFitConfig {
+            enabled: true,
+            tolerance_mm: DEFAULT_ARC_TOLERANCE_MM,
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "default tolerance must return Ok, got {:?}",
+            cfg.validate()
+        );
+    }
+
     // ─── M1: Zero-extrusion explicit-E travel ────────────────────────────────
 
     /// Quarter-arc geometry where every G1 carries `e: Some(0.0)`.
