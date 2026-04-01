@@ -238,10 +238,11 @@ pub fn fit_arcs<'a>(
             FirmwareFlavour::BFB => "BFB",
             FirmwareFlavour::Makerbot => "MAKERBOT",
             FirmwareFlavour::Cura => "Cura (Arc Welder plugin required)",
-            FirmwareFlavour::Unknown => "unknown",
-            // The variants below support arcs and should not reach this branch,
-            // but exhaustiveness requires we cover them.
-            FirmwareFlavour::Marlin
+            // The variants below either support arcs or have no specific label;
+            // they should not normally reach this branch, but exhaustiveness requires
+            // we cover them.
+            FirmwareFlavour::Unknown
+            | FirmwareFlavour::Marlin
             | FirmwareFlavour::Klipper
             | FirmwareFlavour::Smoothieware
             | FirmwareFlavour::PrusaSlicer
@@ -342,7 +343,7 @@ fn flush_candidate<'a>(
         // Defensive: check_arc_candidate calls fit_circle internally; a Some from
         // check implies Some here. This branch is theoretically unreachable.
         tracing::warn!(
-            first_line = candidate.first().map(|p| p.line).unwrap_or(0),
+            first_line = candidate.first().map_or(0, |p| p.line),
             n_points = points.len(),
             "arc_fitter: candidate passed constraint check but fit_circle returned None; flushing verbatim"
         );
