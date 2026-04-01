@@ -335,7 +335,13 @@ fn flush_candidate<'a>(
     }
 
     let Some(circle) = fit_circle(&points) else {
-        // Collinear: flush verbatim.
+        // Defensive: check_arc_candidate calls fit_circle internally; a Some from
+        // check implies Some here. This branch is theoretically unreachable.
+        tracing::warn!(
+            first_line = candidate.first().map(|p| p.line).unwrap_or(0),
+            n_points = points.len(),
+            "arc_fitter: candidate passed constraint check but fit_circle returned None; flushing verbatim"
+        );
         for pt in candidate.drain(..) {
             result.push(Spanned {
                 inner: GCodeCommand::LinearMove {
