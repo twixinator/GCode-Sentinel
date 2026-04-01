@@ -33,9 +33,7 @@ use crate::models::{GCodeCommand, Spanned};
 #[derive(Debug, thiserror::Error)]
 pub enum ArcFitConfigError {
     /// `tolerance_mm` must be strictly positive and finite.
-    #[error(
-        "ArcFitConfig: tolerance_mm must be positive and finite, got {value}"
-    )]
+    #[error("ArcFitConfig: tolerance_mm must be positive and finite, got {value}")]
     InvalidTolerance {
         /// The invalid value that was provided.
         value: f64,
