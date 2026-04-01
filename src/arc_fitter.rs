@@ -59,6 +59,25 @@ impl Default for ArcFitConfig {
     }
 }
 
+impl ArcFitConfig {
+    /// Returns `Err` if `tolerance_mm` is not strictly positive and finite.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when `tolerance_mm` is zero, negative, NaN, or
+    /// infinite — any value that would make the radial-deviation check
+    /// mathematically meaningless.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(self.tolerance_mm > 0.0 && self.tolerance_mm.is_finite()) {
+            return Err(format!(
+                "ArcFitConfig: tolerance_mm must be positive and finite, got {}",
+                self.tolerance_mm
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Result of the arc fitting pre-pass.
 #[derive(Debug)]
 pub struct ArcFitResult<'a> {
@@ -96,6 +115,22 @@ pub fn fit_arcs<'a>(
             commands,
             changes: Vec::new(),
             diagnostics: Vec::new(),
+        };
+    }
+
+    // Validate configuration before doing any work.  An invalid tolerance makes
+    // every per-point radial check meaningless (e.g. NaN comparisons always
+    // produce false), so we surface it as a hard E001 error immediately.
+    if let Err(msg) = config.validate() {
+        return ArcFitResult {
+            commands,
+            changes: Vec::new(),
+            diagnostics: vec![Diagnostic {
+                severity: Severity::Error,
+                line: 0,
+                code: "E001",
+                message: msg,
+            }],
         };
     }
 
@@ -2575,7 +2610,10 @@ mod tests {
             enabled: true,
             tolerance_mm: -1.0,
         };
-        assert!(cfg.validate().is_err(), "negative tolerance must return Err");
+        assert!(
+            cfg.validate().is_err(),
+            "negative tolerance must return Err"
+        );
     }
 
     #[test]
