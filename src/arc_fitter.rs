@@ -2667,4 +2667,111 @@ mod tests {
             "arc with 2× extrusion rate on first segment must be rejected (first segment included after M2 fix)"
         );
     }
+
+    // ─── M3: W004 regression tests for Repetier, BFB, Makerbot ──────────────
+
+    /// Repetier firmware header → `FirmwareFlavour::Repetier` → W004 emitted.
+    #[test]
+    fn test_fit_arcs_repetier_firmware_emits_w004() {
+        use std::borrow::Cow;
+        let pts = arc_points(0.0, 0.0, 10.0, 0.0, FRAC_PI_2, 5);
+        let mut cmds: Vec<Spanned<GCodeCommand<'static>>> = Vec::new();
+        cmds.push(sp(
+            GCodeCommand::Comment {
+                text: Cow::Borrowed("Repetier-Host 2.2.2"),
+            },
+            1,
+        ));
+        cmds.push(sp(
+            GCodeCommand::RapidMove {
+                x: Some(pts[0].0),
+                y: Some(pts[0].1),
+                z: None,
+                f: None,
+            },
+            2,
+        ));
+        cmds.extend(arc_g1_cmds(&pts, 3000.0, 0.05, 0.0));
+
+        let result = fit_arcs(cmds, &enabled_config());
+        assert!(
+            !result.changes.is_empty(),
+            "expected arc fitting to produce at least one change for Repetier firmware test"
+        );
+        let w004 = result.diagnostics.iter().any(|d| d.code == "W004");
+        assert!(
+            w004,
+            "expected W004 diagnostic for Repetier firmware (G2/G3 support not guaranteed)"
+        );
+    }
+
+    /// BFB firmware header → `FirmwareFlavour::BFB` → W004 emitted.
+    #[test]
+    fn test_fit_arcs_bfb_firmware_emits_w004() {
+        use std::borrow::Cow;
+        let pts = arc_points(0.0, 0.0, 10.0, 0.0, FRAC_PI_2, 5);
+        let mut cmds: Vec<Spanned<GCodeCommand<'static>>> = Vec::new();
+        cmds.push(sp(
+            GCodeCommand::Comment {
+                text: Cow::Borrowed("BFB RapMan 3.x firmware"),
+            },
+            1,
+        ));
+        cmds.push(sp(
+            GCodeCommand::RapidMove {
+                x: Some(pts[0].0),
+                y: Some(pts[0].1),
+                z: None,
+                f: None,
+            },
+            2,
+        ));
+        cmds.extend(arc_g1_cmds(&pts, 3000.0, 0.05, 0.0));
+
+        let result = fit_arcs(cmds, &enabled_config());
+        assert!(
+            !result.changes.is_empty(),
+            "expected arc fitting to produce at least one change for BFB firmware test"
+        );
+        let w004 = result.diagnostics.iter().any(|d| d.code == "W004");
+        assert!(
+            w004,
+            "expected W004 diagnostic for BFB firmware (does not support G2/G3)"
+        );
+    }
+
+    /// MakerBot firmware header → `FirmwareFlavour::Makerbot` → W004 emitted.
+    #[test]
+    fn test_fit_arcs_makerbot_firmware_emits_w004() {
+        use std::borrow::Cow;
+        let pts = arc_points(0.0, 0.0, 10.0, 0.0, FRAC_PI_2, 5);
+        let mut cmds: Vec<Spanned<GCodeCommand<'static>>> = Vec::new();
+        cmds.push(sp(
+            GCodeCommand::Comment {
+                text: Cow::Borrowed("MakerBot Replicator 2"),
+            },
+            1,
+        ));
+        cmds.push(sp(
+            GCodeCommand::RapidMove {
+                x: Some(pts[0].0),
+                y: Some(pts[0].1),
+                z: None,
+                f: None,
+            },
+            2,
+        ));
+        cmds.extend(arc_g1_cmds(&pts, 3000.0, 0.05, 0.0));
+
+        let result = fit_arcs(cmds, &enabled_config());
+        assert!(
+            !result.changes.is_empty(),
+            "expected arc fitting to produce at least one change for MakerBot firmware test"
+        );
+        let w004 = result.diagnostics.iter().any(|d| d.code == "W004");
+        assert!(
+            w004,
+            "expected W004 diagnostic for MakerBot firmware (does not support standard G2/G3)"
+        );
+    }
 }
