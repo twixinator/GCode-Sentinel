@@ -209,23 +209,9 @@ pub fn fit_arcs<'a>(
             flush_candidate(&mut candidate, &mut result_commands, &mut changes, config);
             cur_x = resolve_x_from_cmd(&spanned.inner, cur_x);
             cur_y = resolve_y_from_cmd(&spanned.inner, cur_y);
-            // G92 SetPosition resets the logical machine position without moving.
-            // We must update cur_x/cur_y/cur_e here so that subsequent LinearMoves
-            // that omit X or Y resolve the correct absolute coordinate, and so that
-            // e_delta computation against cur_e stays accurate after the reset.
-            // Note: cur_x/cur_y are already handled by resolve_x/y_from_cmd above
-            // for SetPosition; only cur_e remains unique to this block.
-            if let GCodeCommand::SetPosition { e: Some(v), .. } = &spanned.inner {
-                cur_e = *v;
-            }
-            // Update cur_e from pre-existing arc moves (e.g. arcs already in input).
-            match &spanned.inner {
-                GCodeCommand::ArcMoveCW { e: Some(v), .. }
-                | GCodeCommand::ArcMoveCCW { e: Some(v), .. } => {
-                    cur_e = *v;
-                }
-                _ => {}
-            }
+            // Update cur_e from SetPosition (G92) and pre-existing arc moves.
+            // cur_x/cur_y are already handled by resolve_x/y_from_cmd above.
+            cur_e = resolve_e_from_cmd(&spanned.inner, cur_e);
             result_commands.push(spanned);
         }
     }
@@ -446,6 +432,21 @@ fn resolve_y_from_cmd(cmd: &GCodeCommand<'_>, current: f64) -> f64 {
         | GCodeCommand::ArcMoveCW { y: Some(v), .. }
         | GCodeCommand::ArcMoveCCW { y: Some(v), .. }
         | GCodeCommand::SetPosition { y: Some(v), .. } => *v,
+        _ => current,
+    }
+}
+
+/// Returns the extruder position from `cmd` if it carries one, otherwise returns `current`.
+///
+/// Handles: [`GCodeCommand::SetPosition`] (G92 reset), [`GCodeCommand::ArcMoveCW`],
+/// and [`GCodeCommand::ArcMoveCCW`].
+/// All other variants (including [`GCodeCommand::LinearMove`]) return `current` unchanged —
+/// callers must handle `LinearMove` E tracking separately (see the main scan loop).
+fn resolve_e_from_cmd(cmd: &GCodeCommand<'_>, current: f64) -> f64 {
+    match cmd {
+        GCodeCommand::SetPosition { e: Some(v), .. }
+        | GCodeCommand::ArcMoveCW { e: Some(v), .. }
+        | GCodeCommand::ArcMoveCCW { e: Some(v), .. } => *v,
         _ => current,
     }
 }
@@ -2290,10 +2291,7 @@ mod tests {
 
                 let x_val = x.expect("fitted arc must have X endpoint");
                 let y_val = y.expect("fitted arc must have Y endpoint");
-                assert!(
-                    (x_val - 0.0).abs() < 1e-9,
-                    "X endpoint should be 0.0, got {x_val}"
-                );
+                assert!(x_val.abs() < 1e-9, "X endpoint should be 0.0, got {x_val}");
                 assert!(
                     (y_val - 10.0).abs() < 1e-9,
                     "Y endpoint should be 10.0, got {y_val}"
@@ -2341,6 +2339,51 @@ mod tests {
             "command count must be unchanged when G91 guard fires"
         );
         // Confirm no arc command was synthesised — all commands remain as G0/G1.
+        let has_arc = result.commands.iter().any(|c| {
+            matches!(
+                c.inner,
+                GCodeCommand::ArcMoveCCW { .. } | GCodeCommand::ArcMoveCW { .. }
+            )
+        });
+        assert!(
+            !has_arc,
+            "no arc commands should appear when G91 guard fires"
+        );
+    }
+
+    /// G91 guard: SetRelative appearing *after* the seed G0 (mid-sequence) still
+    /// fires the early-return guard, because the guard scans the whole command list.
+    #[test]
+    fn test_fit_arcs_relative_mode_mid_sequence_returns_no_changes() {
+        let pts = arc_points(0.0, 0.0, 10.0, 0.0, FRAC_PI_2, 5);
+
+        let mut cmds: Vec<Spanned<GCodeCommand<'static>>> = Vec::new();
+        // G0 placed BEFORE SetRelative to confirm guard is not position-sensitive.
+        cmds.push(sp(
+            GCodeCommand::RapidMove {
+                x: Some(pts[0].0),
+                y: Some(pts[0].1),
+                z: None,
+                f: None,
+            },
+            1,
+        ));
+        cmds.push(sp(GCodeCommand::SetRelative, 2));
+        cmds.extend(arc_g1_cmds(&pts, 3000.0, 0.05, 0.0));
+
+        let input_len = cmds.len();
+        let result = fit_arcs(cmds, &enabled_config());
+
+        assert!(
+            result.changes.is_empty(),
+            "no changes expected when G91 is present mid-sequence, got {}",
+            result.changes.len()
+        );
+        assert_eq!(
+            result.commands.len(),
+            input_len,
+            "command count must be unchanged when G91 guard fires"
+        );
         let has_arc = result.commands.iter().any(|c| {
             matches!(
                 c.inner,
