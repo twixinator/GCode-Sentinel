@@ -6,6 +6,7 @@ pub mod cli;
 pub mod diagnostics;
 pub mod emitter;
 pub(crate) mod geometry;
+pub mod machine_profile;
 pub mod models;
 pub mod optimizer;
 pub mod parser;

@@ -161,28 +161,68 @@ pub struct Cli {
     /// included in an arc.  Default: 0.02 mm.
     #[arg(long, value_name = "MM")]
     pub arc_tolerance: Option<f64>,
+
+    /// Select a built-in machine profile by name (e.g. `ender3`, `prusa_mk4`).
+    ///
+    /// The profile sets default axis limits and optional firmware metadata.
+    /// Explicit `--max-x/y/z` flags override the profile values.
+    /// Use `--machine help` (or supply an invalid name) to see all available
+    /// profiles listed in the error message.
+    ///
+    /// Resolution order (later overrides earlier):
+    /// defaults → `--config` file → `--machine` profile → explicit flags.
+    #[arg(long, value_name = "PROFILE")]
+    pub machine: Option<String>,
 }
 
 impl Cli {
-    /// Constructs a [`MachineLimits`] value from the axis-limit flags.
+    /// Constructs a [`MachineLimits`] value following the resolution order.
     ///
-    /// Returns `Some` if at least one of `--max-x`, `--max-y`, or `--max-z`
-    /// was supplied on the command line, allowing partial limit configurations
-    /// (e.g. only the Z axis is constrained).  Returns `None` when all three
-    /// are absent, signalling to the pipeline that out-of-bounds checking
-    /// should be skipped or delegated to a config file.
+    /// Resolution order (later source overrides earlier):
+    /// 1. No limits at all (returns `None` when nothing is configured).
+    /// 2. A `--machine` profile supplied via `profile` (axis bounds only).
+    /// 3. Explicit `--max-x`, `--max-y`, `--max-z` flags on the command line.
+    ///
+    /// Returns `Some` when either a profile is given **or** at least one
+    /// explicit axis flag is present.  Returns `None` when both are absent,
+    /// signalling to the pipeline that out-of-bounds checking should be skipped.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gcode_sentinel::cli::Cli;
+    /// use clap::Parser;
+    ///
+    /// let cli = Cli::try_parse_from(["gcode-sentinel", "in.gcode", "--max-x", "220"]).unwrap();
+    /// let limits = cli.machine_limits(None);
+    /// assert_eq!(limits.unwrap().max_x, 220.0);
+    /// ```
     ///
     /// [`MachineLimits`]: crate::models::MachineLimits
     #[must_use]
-    pub fn machine_limits(&self) -> Option<crate::models::MachineLimits> {
-        if self.max_x.is_none() && self.max_y.is_none() && self.max_z.is_none() {
+    pub fn machine_limits(
+        &self,
+        profile: Option<&crate::machine_profile::MachineProfile>,
+    ) -> Option<crate::models::MachineLimits> {
+        let has_explicit = self.max_x.is_some() || self.max_y.is_some() || self.max_z.is_some();
+
+        // Profile base — if a profile was loaded, use it as the starting point.
+        let base: Option<crate::models::MachineLimits> =
+            profile.map(crate::machine_profile::MachineProfile::to_machine_limits);
+
+        if base.is_none() && !has_explicit {
+            // Nothing configured — disable out-of-bounds checking.
             return None;
         }
-        let defaults = crate::models::MachineLimits::default();
+
+        // Start from profile limits when available; fall back to type defaults
+        // only if an explicit flag is present without a profile.
+        let base = base.unwrap_or_default();
+
         Some(crate::models::MachineLimits {
-            max_x: self.max_x.unwrap_or(defaults.max_x),
-            max_y: self.max_y.unwrap_or(defaults.max_y),
-            max_z: self.max_z.unwrap_or(defaults.max_z),
+            max_x: self.max_x.unwrap_or(base.max_x),
+            max_y: self.max_y.unwrap_or(base.max_y),
+            max_z: self.max_z.unwrap_or(base.max_z),
         })
     }
 }
@@ -218,5 +258,96 @@ mod tests {
     fn report_format_defaults_to_text() {
         let cli = Cli::try_parse_from(["gcode-sentinel", "input.gcode"]).unwrap();
         assert!(matches!(cli.report_format, ReportFormat::Text));
+    }
+
+    // ── --machine flag ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_machine_flag_parsed_correctly() {
+        let cli =
+            Cli::try_parse_from(["gcode-sentinel", "input.gcode", "--machine", "ender3"]).unwrap();
+        assert_eq!(cli.machine.as_deref(), Some("ender3"));
+    }
+
+    #[test]
+    fn test_machine_flag_absent_is_none() {
+        let cli = Cli::try_parse_from(["gcode-sentinel", "input.gcode"]).unwrap();
+        assert_eq!(cli.machine, None);
+    }
+
+    // ── machine_limits resolution order ─────────────────────────────────────
+
+    #[test]
+    fn test_machine_limits_no_profile_no_flags_returns_none() {
+        let cli = Cli::try_parse_from(["gcode-sentinel", "input.gcode"]).unwrap();
+        assert!(cli.machine_limits(None).is_none());
+    }
+
+    #[test]
+    fn test_machine_limits_profile_only_uses_profile_values() {
+        use crate::machine_profile::load_profile;
+        let cli = Cli::try_parse_from(["gcode-sentinel", "input.gcode"]).unwrap();
+        let profile = load_profile("ender3").unwrap();
+        let limits = cli.machine_limits(Some(&profile)).unwrap();
+        assert_eq!(limits.max_x, 220.0);
+        assert_eq!(limits.max_y, 220.0);
+        assert_eq!(limits.max_z, 250.0);
+    }
+
+    #[test]
+    fn test_machine_limits_explicit_flags_override_profile() {
+        use crate::machine_profile::load_profile;
+        let cli = Cli::try_parse_from([
+            "gcode-sentinel",
+            "input.gcode",
+            "--max-x",
+            "180.0",
+            "--max-z",
+            "300.0",
+        ])
+        .unwrap();
+        let profile = load_profile("ender3").unwrap(); // ender3: 220 × 220 × 250
+        let limits = cli.machine_limits(Some(&profile)).unwrap();
+        // Explicit --max-x and --max-z override the profile; --max-y falls back to profile.
+        assert_eq!(
+            limits.max_x, 180.0,
+            "explicit --max-x must win over profile"
+        );
+        assert_eq!(limits.max_y, 220.0, "--max-y absent: profile value used");
+        assert_eq!(
+            limits.max_z, 300.0,
+            "explicit --max-z must win over profile"
+        );
+    }
+
+    #[test]
+    fn test_machine_limits_explicit_flags_only_no_profile() {
+        let cli = Cli::try_parse_from([
+            "gcode-sentinel",
+            "input.gcode",
+            "--max-x",
+            "400.0",
+            "--max-y",
+            "400.0",
+            "--max-z",
+            "500.0",
+        ])
+        .unwrap();
+        let limits = cli.machine_limits(None).unwrap();
+        assert_eq!(limits.max_x, 400.0);
+        assert_eq!(limits.max_y, 400.0);
+        assert_eq!(limits.max_z, 500.0);
+    }
+
+    #[test]
+    fn test_machine_limits_single_explicit_flag_with_profile_partial_override() {
+        use crate::machine_profile::load_profile;
+        let cli =
+            Cli::try_parse_from(["gcode-sentinel", "input.gcode", "--max-y", "150.0"]).unwrap();
+        let profile = load_profile("voron_v2").unwrap(); // voron: 350 × 350 × 350
+        let limits = cli.machine_limits(Some(&profile)).unwrap();
+        assert_eq!(limits.max_x, 350.0, "x falls back to profile");
+        assert_eq!(limits.max_y, 150.0, "explicit --max-y overrides profile");
+        assert_eq!(limits.max_z, 350.0, "z falls back to profile");
     }
 }

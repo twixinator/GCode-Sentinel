@@ -13,6 +13,7 @@ use gcode_sentinel::arc_fitter::{fit_arcs, ArcFitConfig, DEFAULT_ARC_TOLERANCE_M
 use gcode_sentinel::cli::{Cli, ReportFormat};
 use gcode_sentinel::diagnostics::{AnalysisReport, OptimizationChange, Severity, ValidationDiff};
 use gcode_sentinel::emitter::{emit, EmitConfig};
+use gcode_sentinel::machine_profile::{self, MachineProfile};
 use gcode_sentinel::optimizer::{optimize, OptConfig};
 use gcode_sentinel::parser::parse_all;
 
@@ -25,7 +26,8 @@ fn main() -> Result<()> {
     validate_input(&cli)?;
     validate_cli_flags(&cli)?;
 
-    let limits = cli.machine_limits();
+    let profile = resolve_machine_profile(&cli)?;
+    let limits = cli.machine_limits(profile.as_ref());
     log_limits(limits.as_ref());
 
     let text = map_input(&cli)?;
@@ -149,6 +151,19 @@ fn main() -> Result<()> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Loads the machine profile selected via `--machine`, if any.
+///
+/// Returns `Ok(None)` when the flag is absent.  Returns a descriptive error
+/// (listing all valid names) when an unknown profile name is supplied.
+fn resolve_machine_profile(cli: &Cli) -> Result<Option<MachineProfile>> {
+    let Some(ref name) = cli.machine else {
+        return Ok(None);
+    };
+    machine_profile::load_profile(name)
+        .map(Some)
+        .with_context(|| format!("failed to load machine profile '{name}'"))
+}
 
 fn init_tracing(verbose: bool) -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
