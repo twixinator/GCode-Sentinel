@@ -13,6 +13,7 @@
 
 use crate::{
     diagnostics::{Diagnostic, PrintStats, Severity},
+    dialect::is_cura_layer_change,
     geometry::arc_span,
     models::{GCodeCommand, MachineLimits, Point3D, Spanned},
 };
@@ -665,18 +666,21 @@ fn handle_set_position(
 
 /// Handle a `Comment` command.
 ///
-/// `OrcaSlicer` emits `;LAYER_CHANGE` as a dedicated comment.  This is more
-/// reliable than Z-based detection because it fires even when a Z move is split
-/// across multiple commands.  When we see it we increment the layer count
-/// directly without re-emitting an `I001` diagnostic (the comment itself is the
-/// ground truth; the Z-based diagnostic remains for slicers that do not emit
-/// the comment).
+/// Recognises two slicer-specific layer-change signals:
+/// - `OrcaSlicer` emits `;LAYER_CHANGE` (exact match).
+/// - `Cura` emits `;LAYER:N` where N is a zero-based layer index.
+///
+/// Both are more reliable than Z-based detection because they fire even when a
+/// Z move is split across multiple commands.  When either is seen, the layer
+/// count is incremented directly and the comment is treated as ground truth.
 fn handle_comment<S: AsRef<str>>(
     text: S,
     printer: &mut PrinterState,
     print_stats: &mut PrintStats,
 ) {
-    if text.as_ref() == "LAYER_CHANGE" {
+    let is_layer_change = text.as_ref() == "LAYER_CHANGE" || is_cura_layer_change(text.as_ref());
+
+    if is_layer_change {
         printer.has_layer_change_comments = true;
         print_stats.layer_count += 1;
         // Push the accumulated time for the layer that just ended, then reset.

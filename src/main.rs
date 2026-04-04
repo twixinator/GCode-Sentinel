@@ -12,6 +12,7 @@ use gcode_sentinel::analyzer::analyze;
 use gcode_sentinel::arc_fitter::{fit_arcs, ArcFitConfig, DEFAULT_ARC_TOLERANCE_MM};
 use gcode_sentinel::cli::{Cli, ReportFormat};
 use gcode_sentinel::diagnostics::{AnalysisReport, OptimizationChange, Severity, ValidationDiff};
+use gcode_sentinel::dialect::{detect_dialect, extract_metadata};
 use gcode_sentinel::emitter::{emit, EmitConfig};
 use gcode_sentinel::optimizer::{optimize, OptConfig};
 use gcode_sentinel::parser::parse_all;
@@ -31,6 +32,8 @@ fn main() -> Result<()> {
     let text = map_input(&cli)?;
     let commands = parse_all(&text).context("parse error in input file")?;
     info!(commands = commands.len(), "parse complete");
+
+    let (dialect, metadata) = detect_slicer(&commands);
 
     let pre_analysis = analyze(commands.iter(), limits.as_ref());
     log_analysis(&pre_analysis.diagnostics);
@@ -97,7 +100,13 @@ fn main() -> Result<()> {
         );
     }
 
-    let mut report = build_report(post_analysis, all_changes, effective_dry_run);
+    let mut report = build_report(
+        post_analysis,
+        all_changes,
+        effective_dry_run,
+        dialect,
+        metadata,
+    );
 
     // Add arc fitting diagnostics (e.g. W004 firmware warning).
     report.diagnostics.extend(arc_result.diagnostics);
@@ -106,21 +115,7 @@ fn main() -> Result<()> {
 
     // Minimum layer time advisory (W003).
     if let Some(threshold) = cli.min_layer_time {
-        for (i, &layer_time) in report.stats.per_layer_times.iter().enumerate() {
-            if layer_time < threshold {
-                report
-                    .diagnostics
-                    .push(gcode_sentinel::diagnostics::Diagnostic {
-                        severity: Severity::Warning,
-                        line: 0,
-                        code: "W003",
-                        message: format!(
-                            "layer {} print time {layer_time:.1}s is below minimum {threshold}s",
-                            i + 1,
-                        ),
-                    });
-            }
-        }
+        emit_min_layer_time_warnings(&mut report, threshold);
     }
 
     print_report(&report)?;
@@ -149,6 +144,46 @@ fn main() -> Result<()> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Append a W003 warning for every layer whose estimated print time falls below
+/// `threshold` seconds.
+fn emit_min_layer_time_warnings(report: &mut AnalysisReport, threshold: f64) {
+    for (i, &layer_time) in report.stats.per_layer_times.iter().enumerate() {
+        if layer_time < threshold {
+            report
+                .diagnostics
+                .push(gcode_sentinel::diagnostics::Diagnostic {
+                    severity: Severity::Warning,
+                    line: 0,
+                    code: "W003",
+                    message: format!(
+                        "layer {} print time {layer_time:.1}s is below minimum {threshold}s",
+                        i + 1,
+                    ),
+                });
+        }
+    }
+}
+
+/// Run dialect detection and metadata extraction over the parsed command slice.
+///
+/// Returns `(dialect, metadata)` where both values are `Option`-wrapped.
+/// Metadata is `None` when no recognisable fields were found (avoids emitting
+/// an empty `{}` object in the JSON report).
+fn detect_slicer(
+    commands: &[gcode_sentinel::models::Spanned<gcode_sentinel::models::GCodeCommand<'_>>],
+) -> (
+    Option<gcode_sentinel::dialect::Dialect>,
+    Option<gcode_sentinel::dialect::SlicerMetadata>,
+) {
+    let dialect = detect_dialect(commands);
+    if let Some(d) = dialect {
+        info!(dialect = ?d, "slicer dialect detected");
+    }
+    let raw = extract_metadata(commands);
+    let metadata = if raw.is_empty() { None } else { Some(raw) };
+    (dialect, metadata)
+}
 
 fn init_tracing(verbose: bool) -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -245,12 +280,16 @@ fn build_report(
     analysis: gcode_sentinel::analyzer::AnalysisResult,
     changes: Vec<OptimizationChange>,
     dry_run: bool,
+    dialect: Option<gcode_sentinel::dialect::Dialect>,
+    metadata: Option<gcode_sentinel::dialect::SlicerMetadata>,
 ) -> AnalysisReport {
     AnalysisReport {
         diagnostics: analysis.diagnostics,
         stats: analysis.stats,
         changes,
         dry_run,
+        dialect,
+        metadata,
     }
 }
 

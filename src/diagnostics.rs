@@ -164,6 +164,16 @@ pub struct AnalysisReport {
 
     /// Whether this was a dry-run (no output file written).
     pub dry_run: bool,
+
+    /// Detected slicer dialect, or `None` if the file's origin could not be
+    /// identified from its header comments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dialect: Option<crate::dialect::Dialect>,
+
+    /// Slicer-embedded metadata extracted from comments, or `None` if no
+    /// recognisable metadata was found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<crate::dialect::SlicerMetadata>,
 }
 
 impl AnalysisReport {
@@ -191,6 +201,26 @@ impl AnalysisReport {
     /// Returns an error if writing to `writer` fails.
     pub fn write_summary<W: fmt::Write>(&self, writer: &mut W) -> fmt::Result {
         writeln!(writer, "═══ GCode-Sentinel Report ═══")?;
+        if let Some(d) = self.dialect {
+            writeln!(writer, "Slicer    : {d:?}")?;
+        }
+        if let Some(ref m) = self.metadata {
+            if let Some(v) = m.nozzle_diameter {
+                writeln!(writer, "Nozzle    : {v} mm")?;
+            }
+            if let Some(v) = m.layer_height {
+                writeln!(writer, "Layer h.  : {v} mm")?;
+            }
+            if let Some(ref v) = m.filament_type {
+                writeln!(writer, "Filament  : {v}")?;
+            }
+            if let Some(v) = m.print_temperature {
+                writeln!(writer, "Print tmp : {v}°C")?;
+            }
+            if let Some(v) = m.bed_temperature {
+                writeln!(writer, "Bed tmp   : {v}°C")?;
+            }
+        }
         writeln!(writer, "Layers    : {}", self.stats.layer_count)?;
         writeln!(writer, "Moves     : {}", self.stats.move_count)?;
         writeln!(writer, "Distance  : {:.1} mm", self.stats.total_distance_mm)?;
@@ -311,6 +341,8 @@ mod tests {
             stats: PrintStats::default(),
             changes: vec![],
             dry_run: false,
+            dialect: None,
+            metadata: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         let val: serde_json::Value = serde_json::from_str(&json).unwrap();

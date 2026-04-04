@@ -259,6 +259,8 @@ fn json_report_valid() {
         stats: analysis.stats,
         changes: opt.changes,
         dry_run: false,
+        dialect: None,
+        metadata: None,
     };
 
     let json_str = serde_json::to_string(&report).expect("must serialize to JSON");
