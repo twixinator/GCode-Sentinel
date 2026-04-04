@@ -40,6 +40,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# TOML deserialization for machine profiles — MIT OR Apache-2.0
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+
 [dev-dependencies]
 # Temporary files in tests — MIT OR Apache-2.0
 tempfile = "3"
