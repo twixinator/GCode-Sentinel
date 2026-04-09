@@ -12,11 +12,13 @@ use gcode_sentinel::analyzer::analyze;
 use gcode_sentinel::arc_fitter::{fit_arcs, ArcFitConfig, DEFAULT_ARC_TOLERANCE_MM};
 use gcode_sentinel::cli::{Cli, ReportFormat};
 use gcode_sentinel::diagnostics::{AnalysisReport, OptimizationChange, Severity, ValidationDiff};
+use gcode_sentinel::dialect::detect_dialect;
 use gcode_sentinel::emitter::{emit, EmitConfig};
 use gcode_sentinel::machine_profile::{self, MachineProfile};
 use gcode_sentinel::optimizer::{optimize, OptConfig};
 use gcode_sentinel::parser::parse_all;
 
+#[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -33,6 +35,28 @@ fn main() -> Result<()> {
     let text = map_input(&cli)?;
     let commands = parse_all(&text).context("parse error in input file")?;
     info!(commands = commands.len(), "parse complete");
+
+    let dialect_override = cli
+        .dialect
+        .map(gcode_sentinel::cli::CliDialect::to_slicer_dialect);
+    let dialect_result = detect_dialect(&commands, dialect_override);
+    if dialect_result.metadata.dialect != gcode_sentinel::dialect::SlicerDialect::Unknown {
+        info!(
+            dialect = ?dialect_result.metadata.dialect,
+            confidence = ?dialect_result.metadata.confidence,
+            "slicer dialect detected"
+        );
+    }
+
+    let mut dialect_diagnostics = dialect_result.diagnostics;
+    if let Some(ref profile) = profile {
+        check_profile_conflicts(
+            &dialect_result.metadata,
+            profile,
+            &commands,
+            &mut dialect_diagnostics,
+        );
+    }
 
     let pre_analysis = analyze(commands.iter(), limits.as_ref());
     log_analysis(&pre_analysis.diagnostics);
@@ -99,8 +123,15 @@ fn main() -> Result<()> {
         );
     }
 
-    let mut report = build_report(post_analysis, all_changes, effective_dry_run);
+    let mut report = build_report(
+        post_analysis,
+        all_changes,
+        effective_dry_run,
+        Some(dialect_result.metadata),
+    );
 
+    // Add dialect detection diagnostics (I004, W005, W006).
+    report.diagnostics.extend(dialect_diagnostics);
     // Add arc fitting diagnostics (e.g. W004 firmware warning).
     report.diagnostics.extend(arc_result.diagnostics);
     // Add progress insertion diagnostics.
@@ -260,12 +291,14 @@ fn build_report(
     analysis: gcode_sentinel::analyzer::AnalysisResult,
     changes: Vec<OptimizationChange>,
     dry_run: bool,
+    slicer: Option<gcode_sentinel::dialect::SlicerMetadata>,
 ) -> AnalysisReport {
     AnalysisReport {
         diagnostics: analysis.diagnostics,
         stats: analysis.stats,
         changes,
         dry_run,
+        slicer,
     }
 }
 
@@ -306,6 +339,43 @@ fn write_report_file(cli: &Cli, report: &AnalysisReport) -> Result<()> {
     }
     info!(path = %path.display(), format = ?cli.report_format, "report file written");
     Ok(())
+}
+
+fn check_profile_conflicts(
+    metadata: &gcode_sentinel::dialect::SlicerMetadata,
+    profile: &MachineProfile,
+    commands: &[gcode_sentinel::models::Spanned<gcode_sentinel::models::GCodeCommand<'_>>],
+    diagnostics: &mut Vec<gcode_sentinel::diagnostics::Diagnostic>,
+) {
+    let slicer_nozzle = metadata.nozzle_diameter_mm;
+
+    if let (Some(slicer_val), Some(profile_val)) = (slicer_nozzle, profile.nozzle_diameter_mm) {
+        if (slicer_val - profile_val).abs() > f64::EPSILON {
+            let line = find_metadata_line(commands, "nozzle_diameter");
+            diagnostics.push(gcode_sentinel::diagnostics::Diagnostic {
+                severity: Severity::Warning,
+                line,
+                code: "W006",
+                message: format!(
+                    "slicer nozzle_diameter ({slicer_val}) differs from machine profile ({profile_val})"
+                ),
+            });
+        }
+    }
+}
+
+fn find_metadata_line(
+    commands: &[gcode_sentinel::models::Spanned<gcode_sentinel::models::GCodeCommand<'_>>],
+    key: &str,
+) -> u32 {
+    for cmd in commands.iter().rev() {
+        if let gcode_sentinel::models::GCodeCommand::Comment { text } = &cmd.inner {
+            if text.contains(key) {
+                return cmd.line;
+            }
+        }
+    }
+    1
 }
 
 fn write_output(

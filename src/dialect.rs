@@ -48,19 +48,19 @@ impl SlicerDialect {
     pub fn expected_fields(self) -> &'static [&'static str] {
         match self {
             Self::OrcaSlicer | Self::PrusaSlicer => &[
-                "nozzle_diameter",
-                "layer_height",
+                "nozzle_diameter_mm",
+                "layer_height_mm",
                 "filament_type",
                 "first_layer_bed_temperature",
-                "nozzle_temperature",
-                "estimated_printing_time",
+                "hotend_temperature",
+                "estimated_time_seconds",
             ],
             Self::Cura => &[
-                "nozzle_diameter",
-                "layer_height",
+                "nozzle_diameter_mm",
+                "layer_height_mm",
                 "filament_type",
                 "bed_temperature",
-                "nozzle_temperature",
+                "hotend_temperature",
                 "print_time",
             ],
             Self::Unknown => &[],
@@ -73,26 +73,42 @@ impl SlicerDialect {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Extracted slicer metadata from G-Code comments.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SlicerMetadata {
     /// Detected slicer dialect.
-    pub dialect: Option<SlicerDialect>,
+    pub dialect: SlicerDialect,
     /// Detection confidence level.
     pub confidence: Confidence,
     /// Slicer version string, if found.
     pub slicer_version: Option<String>,
-    /// Nozzle diameter in mm (as string, e.g. `"0.4"`).
-    pub nozzle_diameter: Option<String>,
-    /// Layer height in mm (as string, e.g. `"0.2"`).
-    pub layer_height: Option<String>,
+    /// Nozzle diameter in mm.
+    pub nozzle_diameter_mm: Option<f64>,
+    /// Layer height in mm.
+    pub layer_height_mm: Option<f64>,
     /// Filament type (e.g. `"PLA"`, `"PETG"`).
     pub filament_type: Option<String>,
-    /// Bed temperature for the first layer (as string, e.g. `"55"`).
-    pub bed_temperature: Option<String>,
-    /// Nozzle / hotend temperature (as string, e.g. `"210"`).
-    pub nozzle_temperature: Option<String>,
-    /// Estimated print time (raw string from slicer).
-    pub estimated_print_time: Option<String>,
+    /// Bed temperature for the first layer in degrees Celsius.
+    pub bed_temperature: Option<f64>,
+    /// Hotend temperature in degrees Celsius.
+    pub hotend_temperature: Option<f64>,
+    /// Estimated print time in seconds.
+    pub estimated_time_seconds: Option<f64>,
+}
+
+impl Default for SlicerMetadata {
+    fn default() -> Self {
+        Self {
+            dialect: SlicerDialect::Unknown,
+            confidence: Confidence::default(),
+            slicer_version: None,
+            nozzle_diameter_mm: None,
+            layer_height_mm: None,
+            filament_type: None,
+            bed_temperature: None,
+            hotend_temperature: None,
+            estimated_time_seconds: None,
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -164,7 +180,7 @@ pub fn detect_dialect(
         heuristic_detection(commands)
     };
 
-    metadata.dialect = Some(dialect);
+    metadata.dialect = dialect;
     metadata.confidence = confidence;
 
     // Extract metadata based on dialect
@@ -280,9 +296,20 @@ fn extract_metadata(
 ) {
     match dialect {
         SlicerDialect::OrcaSlicer | SlicerDialect::PrusaSlicer => {
-            // Footer: last 100 lines
-            let start = commands.len().saturating_sub(100);
-            for cmd in &commands[start..] {
+            // Find CONFIG_BLOCK_START marker scanning backwards; start a
+            // few lines earlier to catch metadata just before the block
+            // (e.g. `estimated printing time` which precedes CONFIG_BLOCK).
+            // Fall back to last 1000 commands for files without the marker.
+            let config_start = match commands.iter().rposition(|c| {
+                matches!(
+                    &c.inner,
+                    GCodeCommand::Comment { text } if text.contains("CONFIG_BLOCK_START")
+                )
+            }) {
+                Some(i) => i.saturating_sub(10),
+                None => commands.len().saturating_sub(1000),
+            };
+            for cmd in &commands[config_start..] {
                 if let GCodeCommand::Comment { text } = &cmd.inner {
                     extract_orca_prusa_field(text, metadata);
                 }
@@ -315,19 +342,19 @@ fn extract_orca_prusa_field(text: &str, metadata: &mut SlicerMetadata) {
 
         match key {
             "nozzle_diameter" => {
-                metadata.nozzle_diameter = Some(value.to_string());
+                metadata.nozzle_diameter_mm = value.parse::<f64>().ok();
             }
             "layer_height" => {
-                metadata.layer_height = Some(value.to_string());
+                metadata.layer_height_mm = value.parse::<f64>().ok();
             }
             "filament_type" => {
                 metadata.filament_type = Some(value.to_string());
             }
             "first_layer_bed_temperature" => {
-                metadata.bed_temperature = Some(value.to_string());
+                metadata.bed_temperature = value.parse::<f64>().ok();
             }
             "nozzle_temperature" => {
-                metadata.nozzle_temperature = Some(value.to_string());
+                metadata.hotend_temperature = value.parse::<f64>().ok();
             }
             _ => {}
         }
@@ -337,7 +364,7 @@ fn extract_orca_prusa_field(text: &str, metadata: &mut SlicerMetadata) {
     // "; estimated printing time (normal mode) = 2h 26m 25s"
     if trimmed.starts_with("estimated printing time") {
         if let Some((_, value)) = trimmed.split_once('=') {
-            metadata.estimated_print_time = Some(value.trim().to_string());
+            metadata.estimated_time_seconds = parse_time_estimate(value.trim());
         }
     }
 }
@@ -355,17 +382,42 @@ fn extract_cura_field(text: &str, metadata: &mut SlicerMetadata) {
     let trimmed = text.trim();
 
     if let Some(val) = trimmed.strip_prefix("Nozzle size:") {
-        metadata.nozzle_diameter = Some(val.trim().to_string());
+        metadata.nozzle_diameter_mm = val.trim().parse::<f64>().ok();
     } else if let Some(val) = trimmed.strip_prefix("Layer height:") {
-        metadata.layer_height = Some(val.trim().to_string());
+        metadata.layer_height_mm = val.trim().parse::<f64>().ok();
     } else if let Some(val) = trimmed.strip_prefix("PRINT.TIME:") {
-        metadata.estimated_print_time = Some(val.trim().to_string());
+        metadata.estimated_time_seconds = val.trim().parse::<f64>().ok();
     } else if let Some(val) = trimmed.strip_prefix("Filament type:") {
         metadata.filament_type = Some(val.trim().to_string());
     } else if let Some(val) = trimmed.strip_prefix("BUILD_PLATE.INITIAL_TEMPERATURE:") {
-        metadata.bed_temperature = Some(val.trim().to_string());
+        metadata.bed_temperature = val.trim().parse::<f64>().ok();
     } else if let Some(val) = trimmed.strip_prefix("EXTRUDER.INITIAL_TEMPERATURE:") {
-        metadata.nozzle_temperature = Some(val.trim().to_string());
+        metadata.hotend_temperature = val.trim().parse::<f64>().ok();
+    }
+}
+
+/// Parse a time estimate string like "2h 26m 25s" into total seconds.
+fn parse_time_estimate(text: &str) -> Option<f64> {
+    let mut total = 0.0_f64;
+    let mut current_num = String::new();
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            current_num.push(c);
+        } else if !current_num.is_empty() {
+            let n: f64 = current_num.parse().ok()?;
+            match c {
+                'h' => total += n * 3600.0,
+                'm' => total += n * 60.0,
+                's' => total += n,
+                _ => {}
+            }
+            current_num.clear();
+        }
+    }
+    if total > 0.0 {
+        Some(total)
+    } else {
+        None
     }
 }
 
@@ -391,12 +443,12 @@ fn collect_missing_fields(
     let mut missing = Vec::new();
     for &field in expected {
         let present = match field {
-            "nozzle_diameter" => metadata.nozzle_diameter.is_some(),
-            "layer_height" => metadata.layer_height.is_some(),
+            "nozzle_diameter_mm" => metadata.nozzle_diameter_mm.is_some(),
+            "layer_height_mm" => metadata.layer_height_mm.is_some(),
             "filament_type" => metadata.filament_type.is_some(),
             "first_layer_bed_temperature" | "bed_temperature" => metadata.bed_temperature.is_some(),
-            "nozzle_temperature" => metadata.nozzle_temperature.is_some(),
-            "estimated_printing_time" | "print_time" => metadata.estimated_print_time.is_some(),
+            "hotend_temperature" => metadata.hotend_temperature.is_some(),
+            "estimated_time_seconds" | "print_time" => metadata.estimated_time_seconds.is_some(),
             _ => true,
         };
         if !present {
@@ -453,8 +505,8 @@ mod tests {
     fn given_orcaslicer_when_expected_fields_then_returns_six_fields() {
         let fields = SlicerDialect::OrcaSlicer.expected_fields();
         assert_eq!(fields.len(), 6);
-        assert!(fields.contains(&"nozzle_diameter"));
-        assert!(fields.contains(&"estimated_printing_time"));
+        assert!(fields.contains(&"nozzle_diameter_mm"));
+        assert!(fields.contains(&"estimated_time_seconds"));
     }
 
     #[test]
@@ -478,7 +530,7 @@ mod tests {
             comment(2, " some other comment"),
         ];
         let result = detect_dialect(&commands, None);
-        assert_eq!(result.metadata.dialect, Some(SlicerDialect::OrcaSlicer));
+        assert_eq!(result.metadata.dialect, SlicerDialect::OrcaSlicer);
         assert_eq!(result.metadata.confidence, Confidence::High);
         assert_eq!(result.metadata.slicer_version.as_deref(), Some("2.1.0"));
     }
@@ -490,7 +542,7 @@ mod tests {
             " generated by PrusaSlicer 2.7.1+linux on 2024-03-01",
         )];
         let result = detect_dialect(&commands, None);
-        assert_eq!(result.metadata.dialect, Some(SlicerDialect::PrusaSlicer));
+        assert_eq!(result.metadata.dialect, SlicerDialect::PrusaSlicer);
         assert_eq!(result.metadata.confidence, Confidence::High);
         assert_eq!(
             result.metadata.slicer_version.as_deref(),
@@ -502,7 +554,7 @@ mod tests {
     fn given_cura_flavor_comment_when_detected_then_high_confidence() {
         let commands = vec![comment(1, "FLAVOR:Marlin")];
         let result = detect_dialect(&commands, None);
-        assert_eq!(result.metadata.dialect, Some(SlicerDialect::Cura));
+        assert_eq!(result.metadata.dialect, SlicerDialect::Cura);
         assert_eq!(result.metadata.confidence, Confidence::High);
     }
 
@@ -510,7 +562,7 @@ mod tests {
     fn given_cura_generated_with_comment_when_detected_then_extracts_version() {
         let commands = vec![comment(1, " Generated with Cura_SteamEngine 5.6.0")];
         let result = detect_dialect(&commands, None);
-        assert_eq!(result.metadata.dialect, Some(SlicerDialect::Cura));
+        assert_eq!(result.metadata.dialect, SlicerDialect::Cura);
         assert_eq!(result.metadata.slicer_version.as_deref(), Some("5.6.0"));
     }
 
@@ -518,7 +570,7 @@ mod tests {
     fn given_case_insensitive_header_when_detected_then_matches() {
         let commands = vec![comment(1, " GENERATED BY ORCASLICER 2.0.0")];
         let result = detect_dialect(&commands, None);
-        assert_eq!(result.metadata.dialect, Some(SlicerDialect::OrcaSlicer));
+        assert_eq!(result.metadata.dialect, SlicerDialect::OrcaSlicer);
         assert_eq!(result.metadata.confidence, Confidence::High);
     }
 
@@ -528,7 +580,7 @@ mod tests {
     fn given_m73_with_p_and_r_when_heuristic_then_orca_signal() {
         let commands = vec![meta(1, 73, "P50 R30"), meta(2, 73, "P75 R15")];
         let result = detect_dialect(&commands, None);
-        assert_eq!(result.metadata.dialect, Some(SlicerDialect::OrcaSlicer));
+        assert_eq!(result.metadata.dialect, SlicerDialect::OrcaSlicer);
         assert_eq!(result.metadata.confidence, Confidence::Medium);
     }
 
@@ -536,7 +588,7 @@ mod tests {
     fn given_m73_with_p_only_when_heuristic_then_cura_signal() {
         let commands = vec![meta(1, 73, "P50"), meta(2, 73, "P75")];
         let result = detect_dialect(&commands, None);
-        assert_eq!(result.metadata.dialect, Some(SlicerDialect::Cura));
+        assert_eq!(result.metadata.dialect, SlicerDialect::Cura);
         assert_eq!(result.metadata.confidence, Confidence::Medium);
     }
 
@@ -544,7 +596,7 @@ mod tests {
     fn given_m900_when_heuristic_then_prusaslicer_signal() {
         let commands = vec![meta(1, 900, "K0.04"), comment(2, "TYPE:External perimeter")];
         let result = detect_dialect(&commands, None);
-        assert_eq!(result.metadata.dialect, Some(SlicerDialect::PrusaSlicer));
+        assert_eq!(result.metadata.dialect, SlicerDialect::PrusaSlicer);
         assert_eq!(result.metadata.confidence, Confidence::Medium);
     }
 
@@ -552,7 +604,7 @@ mod tests {
     fn given_single_type_comment_when_heuristic_then_low_confidence() {
         let commands = vec![comment(1, "TYPE:Infill")];
         let result = detect_dialect(&commands, None);
-        assert_eq!(result.metadata.dialect, Some(SlicerDialect::OrcaSlicer));
+        assert_eq!(result.metadata.dialect, SlicerDialect::OrcaSlicer);
         assert_eq!(result.metadata.confidence, Confidence::Low);
     }
 
@@ -560,7 +612,7 @@ mod tests {
     fn given_no_signals_when_heuristic_then_unknown() {
         let commands = vec![meta(1, 104, "S200")];
         let result = detect_dialect(&commands, None);
-        assert_eq!(result.metadata.dialect, Some(SlicerDialect::Unknown));
+        assert_eq!(result.metadata.dialect, SlicerDialect::Unknown);
         assert_eq!(result.metadata.confidence, Confidence::None);
     }
 
@@ -570,7 +622,7 @@ mod tests {
     fn given_dialect_override_when_detected_then_uses_override() {
         let commands = vec![comment(1, " generated by OrcaSlicer 2.1.0")];
         let result = detect_dialect(&commands, Some(SlicerDialect::PrusaSlicer));
-        assert_eq!(result.metadata.dialect, Some(SlicerDialect::PrusaSlicer));
+        assert_eq!(result.metadata.dialect, SlicerDialect::PrusaSlicer);
         assert_eq!(result.metadata.confidence, Confidence::High);
     }
 
@@ -607,12 +659,12 @@ mod tests {
 
         let result = detect_dialect(&commands, None);
         let m = &result.metadata;
-        assert_eq!(m.nozzle_diameter.as_deref(), Some("0.4"));
-        assert_eq!(m.layer_height.as_deref(), Some("0.2"));
+        assert_eq!(m.nozzle_diameter_mm, Some(0.4));
+        assert_eq!(m.layer_height_mm, Some(0.2));
         assert_eq!(m.filament_type.as_deref(), Some("PLA"));
-        assert_eq!(m.bed_temperature.as_deref(), Some("55"));
-        assert_eq!(m.nozzle_temperature.as_deref(), Some("210"));
-        assert_eq!(m.estimated_print_time.as_deref(), Some("2h 26m 25s"));
+        assert_eq!(m.bed_temperature, Some(55.0));
+        assert_eq!(m.hotend_temperature, Some(210.0));
+        assert_eq!(m.estimated_time_seconds, Some(8785.0));
     }
 
     #[test]
@@ -623,7 +675,7 @@ mod tests {
         commands.push(comment(3, " nozzle_temperature = 210"));
 
         let result = detect_dialect(&commands, None);
-        assert_eq!(result.metadata.nozzle_temperature.as_deref(), Some("210"));
+        assert_eq!(result.metadata.hotend_temperature, Some(210.0));
     }
 
     // ── Metadata extraction: Cura header ─────────────────────────────────
@@ -642,12 +694,12 @@ mod tests {
 
         let result = detect_dialect(&commands, None);
         let m = &result.metadata;
-        assert_eq!(m.nozzle_diameter.as_deref(), Some("0.4"));
-        assert_eq!(m.layer_height.as_deref(), Some("0.2"));
-        assert_eq!(m.estimated_print_time.as_deref(), Some("3600"));
+        assert_eq!(m.nozzle_diameter_mm, Some(0.4));
+        assert_eq!(m.layer_height_mm, Some(0.2));
+        assert_eq!(m.estimated_time_seconds, Some(3600.0));
         assert_eq!(m.filament_type.as_deref(), Some("PLA"));
-        assert_eq!(m.bed_temperature.as_deref(), Some("60"));
-        assert_eq!(m.nozzle_temperature.as_deref(), Some("210"));
+        assert_eq!(m.bed_temperature, Some(60.0));
+        assert_eq!(m.hotend_temperature, Some(210.0));
     }
 
     // ── Diagnostics ──────────────────────────────────────────────────────
@@ -723,14 +775,14 @@ mod tests {
     #[test]
     fn given_metadata_when_serialized_then_valid_json() {
         let m = SlicerMetadata {
-            dialect: Some(SlicerDialect::Cura),
+            dialect: SlicerDialect::Cura,
             confidence: Confidence::High,
-            nozzle_diameter: Some("0.4".to_string()),
+            nozzle_diameter_mm: Some(0.4),
             ..SlicerMetadata::default()
         };
         let json = serde_json::to_string(&m).unwrap();
         assert!(json.contains("\"Cura\""));
-        assert!(json.contains("\"0.4\""));
+        assert!(json.contains("0.4"));
     }
 
     // ── Edge cases ───────────────────────────────────────────────────────
@@ -738,7 +790,7 @@ mod tests {
     #[test]
     fn given_empty_commands_when_detected_then_unknown() {
         let result = detect_dialect(&[], None);
-        assert_eq!(result.metadata.dialect, Some(SlicerDialect::Unknown));
+        assert_eq!(result.metadata.dialect, SlicerDialect::Unknown);
         assert_eq!(result.metadata.confidence, Confidence::None);
     }
 
@@ -751,6 +803,6 @@ mod tests {
         commands.push(comment(101, " generated by OrcaSlicer 2.0.0"));
         let result = detect_dialect(&commands, None);
         // Phase 1 won't find it; heuristics won't match either
-        assert_eq!(result.metadata.dialect, Some(SlicerDialect::Unknown));
+        assert_eq!(result.metadata.dialect, SlicerDialect::Unknown);
     }
 }

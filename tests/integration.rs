@@ -259,6 +259,7 @@ fn json_report_valid() {
         stats: analysis.stats,
         changes: opt.changes,
         dry_run: false,
+        slicer: None,
     };
 
     let json_str = serde_json::to_string(&report).expect("must serialize to JSON");
@@ -696,4 +697,52 @@ fn arc_fit_preserves_extrusion_on_existing_fixtures() {
             diff.new_errors
         );
     }
+}
+
+// ── Dialect detection ───────────────────────────────────────────────────────
+
+#[test]
+fn detect_dialect_malm_slide_is_orcaslicer() {
+    let text = fs::read_to_string(fixture("malm_slide.gcode"))
+        .expect("fixture malm_slide.gcode must exist");
+    let cmds = parse_all(&text).expect("malm_slide.gcode must parse");
+
+    let result = gcode_sentinel::dialect::detect_dialect(&cmds, None);
+    assert_eq!(
+        result.metadata.dialect,
+        gcode_sentinel::dialect::SlicerDialect::OrcaSlicer
+    );
+    assert_eq!(
+        result.metadata.confidence,
+        gcode_sentinel::dialect::Confidence::High
+    );
+    assert!(
+        result.metadata.slicer_version.is_some(),
+        "OrcaSlicer version should be extracted"
+    );
+    assert_eq!(result.metadata.nozzle_diameter_mm, Some(0.4));
+    assert_eq!(result.metadata.layer_height_mm, Some(0.2));
+    assert_eq!(result.metadata.filament_type.as_deref(), Some("PLA"));
+    assert_eq!(result.metadata.bed_temperature, Some(55.0));
+    assert_eq!(result.metadata.hotend_temperature, Some(210.0));
+    assert!(
+        result.metadata.estimated_time_seconds.is_some(),
+        "estimated time should be extracted"
+    );
+}
+
+#[test]
+fn detect_dialect_rose_is_orcaslicer() {
+    let text = fs::read_to_string(fixture("rose.gcode")).expect("fixture rose.gcode must exist");
+    let cmds = parse_all(&text).expect("rose.gcode must parse");
+
+    let result = gcode_sentinel::dialect::detect_dialect(&cmds, None);
+    assert_eq!(
+        result.metadata.dialect,
+        gcode_sentinel::dialect::SlicerDialect::OrcaSlicer
+    );
+    assert_eq!(
+        result.metadata.confidence,
+        gcode_sentinel::dialect::Confidence::High
+    );
 }
