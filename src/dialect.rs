@@ -95,6 +95,32 @@ pub struct SlicerMetadata {
     pub estimated_time_seconds: Option<f64>,
 }
 
+impl SlicerMetadata {
+    /// Collect names of expected metadata fields that are missing.
+    #[must_use]
+    pub fn missing_fields(&self, expected: &[&'static str]) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        for &field in expected {
+            let present = match field {
+                "nozzle_diameter_mm" => self.nozzle_diameter_mm.is_some(),
+                "layer_height_mm" => self.layer_height_mm.is_some(),
+                "filament_type" => self.filament_type.is_some(),
+                "first_layer_bed_temperature" | "bed_temperature" => self.bed_temperature.is_some(),
+                "hotend_temperature" => self.hotend_temperature.is_some(),
+                "estimated_time_seconds" | "print_time" => self.estimated_time_seconds.is_some(),
+                _ => {
+                    debug_assert!(false, "unhandled expected field: {field}");
+                    true
+                }
+            };
+            if !present {
+                missing.push(field);
+            }
+        }
+        missing
+    }
+}
+
 impl Default for SlicerMetadata {
     fn default() -> Self {
         Self {
@@ -159,7 +185,9 @@ pub fn detect_dialect(
                     phase1_line = cmd.line;
                     metadata.slicer_version = extract_version_after(text, "PrusaSlicer");
                     break;
-                } else if lower.contains("flavor:") || lower.contains("generated with cura") {
+                } else if lower.trim().starts_with("flavor:")
+                    || lower.contains("generated with cura")
+                {
                     phase1_dialect = Some(SlicerDialect::Cura);
                     phase1_line = cmd.line;
                     if lower.contains("generated with cura") {
@@ -184,7 +212,7 @@ pub fn detect_dialect(
     metadata.confidence = confidence;
 
     // Extract metadata based on dialect
-    extract_metadata(commands, dialect, &mut metadata);
+    extract_metadata(commands, dialect, &mut metadata, &mut diagnostics);
 
     // Emit I004 diagnostic
     let detection_line = if dialect_override.is_some() {
@@ -207,7 +235,7 @@ pub fn detect_dialect(
     // W005: expected metadata missing (suppressed when dialect_override is Some)
     if dialect_override.is_none() && dialect != SlicerDialect::Unknown {
         let expected = dialect.expected_fields();
-        let missing = collect_missing_fields(&metadata, expected);
+        let missing = metadata.missing_fields(expected);
         for field in missing {
             diagnostics.push(Diagnostic {
                 severity: Severity::Warning,
@@ -293,6 +321,7 @@ fn extract_metadata(
     commands: &[Spanned<GCodeCommand<'_>>],
     dialect: SlicerDialect,
     metadata: &mut SlicerMetadata,
+    diagnostics: &mut Vec<Diagnostic>,
 ) {
     match dialect {
         SlicerDialect::OrcaSlicer | SlicerDialect::PrusaSlicer => {
@@ -311,7 +340,7 @@ fn extract_metadata(
             };
             for cmd in &commands[config_start..] {
                 if let GCodeCommand::Comment { text } = &cmd.inner {
-                    extract_orca_prusa_field(text, metadata);
+                    extract_orca_prusa_field(text, metadata, diagnostics);
                 }
             }
         }
@@ -320,7 +349,7 @@ fn extract_metadata(
             let limit = commands.len().min(100);
             for cmd in &commands[..limit] {
                 if let GCodeCommand::Comment { text } = &cmd.inner {
-                    extract_cura_field(text, metadata);
+                    extract_cura_field(text, metadata, diagnostics);
                 }
             }
         }
@@ -332,7 +361,11 @@ fn extract_metadata(
 ///
 /// Expected format: ` key = value` (with leading space after semicolon stripped
 /// by the parser). Uses exact key matching to avoid sub-key collisions.
-fn extract_orca_prusa_field(text: &str, metadata: &mut SlicerMetadata) {
+fn extract_orca_prusa_field(
+    text: &str,
+    metadata: &mut SlicerMetadata,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     let trimmed = text.trim();
 
     // Split on first '=' only
@@ -341,21 +374,59 @@ fn extract_orca_prusa_field(text: &str, metadata: &mut SlicerMetadata) {
         let value = value.trim();
 
         match key {
-            "nozzle_diameter" => {
-                metadata.nozzle_diameter_mm = value.parse::<f64>().ok();
-            }
-            "layer_height" => {
-                metadata.layer_height_mm = value.parse::<f64>().ok();
-            }
+            "nozzle_diameter" => match value.parse::<f64>() {
+                Ok(v) if v.is_finite() => metadata.nozzle_diameter_mm = Some(v),
+                _ => {
+                    diagnostics.push(Diagnostic {
+                        severity: Severity::Warning,
+                        line: 0,
+                        code: "W007",
+                        message: format!(
+                            "nozzle_diameter present but value unparseable: \"{value}\""
+                        ),
+                    });
+                }
+            },
+            "layer_height" => match value.parse::<f64>() {
+                Ok(v) if v.is_finite() => metadata.layer_height_mm = Some(v),
+                _ => {
+                    diagnostics.push(Diagnostic {
+                        severity: Severity::Warning,
+                        line: 0,
+                        code: "W007",
+                        message: format!("layer_height present but value unparseable: \"{value}\""),
+                    });
+                }
+            },
             "filament_type" => {
                 metadata.filament_type = Some(value.to_string());
             }
-            "first_layer_bed_temperature" => {
-                metadata.bed_temperature = value.parse::<f64>().ok();
-            }
-            "nozzle_temperature" => {
-                metadata.hotend_temperature = value.parse::<f64>().ok();
-            }
+            "first_layer_bed_temperature" => match value.parse::<f64>() {
+                Ok(v) if v.is_finite() => metadata.bed_temperature = Some(v),
+                _ => {
+                    diagnostics.push(Diagnostic {
+                        severity: Severity::Warning,
+                        line: 0,
+                        code: "W007",
+                        message: format!(
+                            "first_layer_bed_temperature present but value unparseable: \"{value}\""
+                        ),
+                    });
+                }
+            },
+            "nozzle_temperature" => match value.parse::<f64>() {
+                Ok(v) if v.is_finite() => metadata.hotend_temperature = Some(v),
+                _ => {
+                    diagnostics.push(Diagnostic {
+                        severity: Severity::Warning,
+                        line: 0,
+                        code: "W007",
+                        message: format!(
+                            "nozzle_temperature present but value unparseable: \"{value}\""
+                        ),
+                    });
+                }
+            },
             _ => {}
         }
     }
@@ -378,21 +449,84 @@ fn extract_orca_prusa_field(text: &str, metadata: &mut SlicerMetadata) {
 /// - `Filament type: PLA`
 /// - `BUILD_PLATE.INITIAL_TEMPERATURE:60`
 /// - `EXTRUDER.INITIAL_TEMPERATURE:210`
-fn extract_cura_field(text: &str, metadata: &mut SlicerMetadata) {
+fn extract_cura_field(
+    text: &str,
+    metadata: &mut SlicerMetadata,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     let trimmed = text.trim();
 
     if let Some(val) = trimmed.strip_prefix("Nozzle size:") {
-        metadata.nozzle_diameter_mm = val.trim().parse::<f64>().ok();
+        let val = val.trim();
+        match val.parse::<f64>() {
+            Ok(v) if v.is_finite() => metadata.nozzle_diameter_mm = Some(v),
+            _ => {
+                diagnostics.push(Diagnostic {
+                    severity: Severity::Warning,
+                    line: 0,
+                    code: "W007",
+                    message: format!("Nozzle size present but value unparseable: \"{val}\""),
+                });
+            }
+        }
     } else if let Some(val) = trimmed.strip_prefix("Layer height:") {
-        metadata.layer_height_mm = val.trim().parse::<f64>().ok();
+        let val = val.trim();
+        match val.parse::<f64>() {
+            Ok(v) if v.is_finite() => metadata.layer_height_mm = Some(v),
+            _ => {
+                diagnostics.push(Diagnostic {
+                    severity: Severity::Warning,
+                    line: 0,
+                    code: "W007",
+                    message: format!("Layer height present but value unparseable: \"{val}\""),
+                });
+            }
+        }
     } else if let Some(val) = trimmed.strip_prefix("PRINT.TIME:") {
-        metadata.estimated_time_seconds = val.trim().parse::<f64>().ok();
+        let val = val.trim();
+        match val.parse::<f64>() {
+            Ok(v) if v.is_finite() => metadata.estimated_time_seconds = Some(v),
+            _ => {
+                diagnostics.push(Diagnostic {
+                    severity: Severity::Warning,
+                    line: 0,
+                    code: "W007",
+                    message: format!("PRINT.TIME present but value unparseable: \"{val}\""),
+                });
+            }
+        }
     } else if let Some(val) = trimmed.strip_prefix("Filament type:") {
         metadata.filament_type = Some(val.trim().to_string());
     } else if let Some(val) = trimmed.strip_prefix("BUILD_PLATE.INITIAL_TEMPERATURE:") {
-        metadata.bed_temperature = val.trim().parse::<f64>().ok();
+        let val = val.trim();
+        match val.parse::<f64>() {
+            Ok(v) if v.is_finite() => metadata.bed_temperature = Some(v),
+            _ => {
+                diagnostics.push(Diagnostic {
+                    severity: Severity::Warning,
+                    line: 0,
+                    code: "W007",
+                    message: format!(
+                        "BUILD_PLATE.INITIAL_TEMPERATURE present but value unparseable: \"{val}\""
+                    ),
+                });
+            }
+        }
     } else if let Some(val) = trimmed.strip_prefix("EXTRUDER.INITIAL_TEMPERATURE:") {
-        metadata.hotend_temperature = val.trim().parse::<f64>().ok();
+        let val = val.trim();
+        match val.parse::<f64>() {
+            Ok(v) if v.is_finite() => metadata.hotend_temperature = Some(v),
+            _ => {
+                diagnostics.push(Diagnostic {
+                    severity: Severity::Warning,
+                    line: 0,
+                    code: "W007",
+                    message: format!(
+                        "EXTRUDER.INITIAL_TEMPERATURE present but value unparseable: \"{val}\""
+                    ),
+                });
+            }
+        }
     }
 }
 
@@ -414,6 +548,12 @@ fn parse_time_estimate(text: &str) -> Option<f64> {
             current_num.clear();
         }
     }
+    // Treat trailing digits without a suffix as raw seconds.
+    if !current_num.is_empty() {
+        if let Ok(n) = current_num.parse::<f64>() {
+            total += n;
+        }
+    }
     if total > 0.0 {
         Some(total)
     } else {
@@ -421,9 +561,11 @@ fn parse_time_estimate(text: &str) -> Option<f64> {
     }
 }
 
-/// Extract a version number that follows a keyword in a comment.
+/// Extract a version number that follows a keyword in a comment (case-insensitive).
 fn extract_version_after(text: &str, keyword: &str) -> Option<String> {
-    let idx = text.find(keyword)?;
+    let lower = text.to_lowercase();
+    let kw_lower = keyword.to_lowercase();
+    let idx = lower.find(&kw_lower)?;
     let after = &text[idx + keyword.len()..];
     let trimmed = after.trim();
     // Take the first whitespace-delimited token as the version
@@ -433,29 +575,6 @@ fn extract_version_after(text: &str, keyword: &str) -> Option<String> {
     } else {
         Some(version.to_string())
     }
-}
-
-/// Collect names of expected metadata fields that are missing.
-fn collect_missing_fields(
-    metadata: &SlicerMetadata,
-    expected: &[&'static str],
-) -> Vec<&'static str> {
-    let mut missing = Vec::new();
-    for &field in expected {
-        let present = match field {
-            "nozzle_diameter_mm" => metadata.nozzle_diameter_mm.is_some(),
-            "layer_height_mm" => metadata.layer_height_mm.is_some(),
-            "filament_type" => metadata.filament_type.is_some(),
-            "first_layer_bed_temperature" | "bed_temperature" => metadata.bed_temperature.is_some(),
-            "hotend_temperature" => metadata.hotend_temperature.is_some(),
-            "estimated_time_seconds" | "print_time" => metadata.estimated_time_seconds.is_some(),
-            _ => true,
-        };
-        if !present {
-            missing.push(field);
-        }
-    }
-    missing
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -572,6 +691,7 @@ mod tests {
         let result = detect_dialect(&commands, None);
         assert_eq!(result.metadata.dialect, SlicerDialect::OrcaSlicer);
         assert_eq!(result.metadata.confidence, Confidence::High);
+        assert_eq!(result.metadata.slicer_version.as_deref(), Some("2.0.0"));
     }
 
     // ── Phase 2: heuristic detection ─────────────────────────────────────
@@ -803,6 +923,95 @@ mod tests {
         commands.push(comment(101, " generated by OrcaSlicer 2.0.0"));
         let result = detect_dialect(&commands, None);
         // Phase 1 won't find it; heuristics won't match either
+        assert_eq!(result.metadata.dialect, SlicerDialect::Unknown);
+    }
+
+    // ── parse_time_estimate ─────────────────────────────────────────────
+
+    #[test]
+    fn given_hms_string_when_parsed_then_returns_total_seconds() {
+        assert_eq!(parse_time_estimate("2h 26m 25s"), Some(8785.0));
+    }
+
+    #[test]
+    fn given_minutes_seconds_when_parsed_then_returns_total_seconds() {
+        assert_eq!(parse_time_estimate("45m 10s"), Some(2710.0));
+    }
+
+    #[test]
+    fn given_seconds_only_when_parsed_then_returns_seconds() {
+        assert_eq!(parse_time_estimate("30s"), Some(30.0));
+    }
+
+    #[test]
+    fn given_raw_seconds_when_parsed_then_treats_as_seconds() {
+        assert_eq!(parse_time_estimate("3600"), Some(3600.0));
+    }
+
+    #[test]
+    fn given_trailing_digits_when_parsed_then_treats_as_seconds() {
+        assert_eq!(parse_time_estimate("2h 26m 25"), Some(8785.0));
+    }
+
+    #[test]
+    fn given_empty_string_when_parsed_then_returns_none() {
+        assert_eq!(parse_time_estimate(""), None);
+    }
+
+    #[test]
+    fn given_no_digits_when_parsed_then_returns_none() {
+        assert_eq!(parse_time_estimate("no time"), None);
+    }
+
+    // ── W007 diagnostics ────────────────────────────────────────────────
+
+    #[test]
+    fn given_unparseable_nozzle_diameter_when_extracted_then_emits_w007() {
+        let mut commands = vec![comment(1, " generated by OrcaSlicer 2.0.0")];
+        commands.push(comment(2, " nozzle_diameter = abc"));
+        let result = detect_dialect(&commands, None);
+        let w007s: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "W007")
+            .collect();
+        assert_eq!(w007s.len(), 1);
+        assert!(w007s[0].message.contains("nozzle_diameter"));
+        assert!(w007s[0].message.contains("abc"));
+    }
+
+    #[test]
+    fn given_nan_value_when_extracted_then_emits_w007() {
+        let mut commands = vec![comment(1, " generated by OrcaSlicer 2.0.0")];
+        commands.push(comment(2, " nozzle_diameter = NaN"));
+        let result = detect_dialect(&commands, None);
+        let w007s: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "W007")
+            .collect();
+        assert_eq!(w007s.len(), 1);
+    }
+
+    #[test]
+    fn given_infinity_value_when_extracted_then_emits_w007() {
+        let mut commands = vec![comment(1, " generated by OrcaSlicer 2.0.0")];
+        commands.push(comment(2, " layer_height = inf"));
+        let result = detect_dialect(&commands, None);
+        let w007s: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "W007")
+            .collect();
+        assert_eq!(w007s.len(), 1);
+    }
+
+    // ── FLAVOR false positive ───────────────────────────────────────────
+
+    #[test]
+    fn given_flavor_in_middle_of_comment_when_detected_then_no_cura_match() {
+        let commands = vec![comment(1, " some text with flavor: something in it")];
+        let result = detect_dialect(&commands, None);
         assert_eq!(result.metadata.dialect, SlicerDialect::Unknown);
     }
 }

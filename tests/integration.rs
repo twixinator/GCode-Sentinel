@@ -699,6 +699,17 @@ fn arc_fit_preserves_extrusion_on_existing_fixtures() {
     }
 }
 
+// ── CLI parsing ─────────────────────────────────────────────────────────────
+
+#[test]
+fn cli_dialect_flag_parsed() {
+    use clap::Parser;
+    use gcode_sentinel::cli::Cli;
+    let cli =
+        Cli::try_parse_from(["gcode-sentinel", "input.gcode", "--dialect", "orca-slicer"]).unwrap();
+    assert!(cli.dialect.is_some());
+}
+
 // ── Dialect detection ───────────────────────────────────────────────────────
 
 #[test]
@@ -745,4 +756,46 @@ fn detect_dialect_rose_is_orcaslicer() {
         result.metadata.confidence,
         gcode_sentinel::dialect::Confidence::High
     );
+}
+
+#[test]
+fn detect_dialect_override_suppresses_w005() {
+    let text = fs::read_to_string(fixture("malm_slide.gcode")).expect("fixture must exist");
+    let cmds = parse_all(&text).expect("must parse");
+    let result = gcode_sentinel::dialect::detect_dialect(
+        &cmds,
+        Some(gcode_sentinel::dialect::SlicerDialect::PrusaSlicer),
+    );
+    // W005 should be suppressed for explicit overrides
+    assert!(result.diagnostics.iter().all(|d| d.code != "W005"));
+    // But I004 should still fire
+    assert!(result.diagnostics.iter().any(|d| d.code == "I004"));
+}
+
+// ── Time estimate extraction via detect_dialect ─────────────────────────────
+
+#[test]
+fn detect_dialect_malm_slide_extracts_estimated_time() {
+    let text = fs::read_to_string(fixture("malm_slide.gcode")).expect("fixture must exist");
+    let cmds = parse_all(&text).expect("must parse");
+    let result = gcode_sentinel::dialect::detect_dialect(&cmds, None);
+    assert!(
+        result.metadata.estimated_time_seconds.is_some(),
+        "OrcaSlicer fixture must have an estimated time"
+    );
+    let time = result.metadata.estimated_time_seconds.unwrap();
+    assert!(time > 0.0, "estimated time must be positive, got {time}");
+}
+
+#[test]
+fn detect_dialect_rose_extracts_estimated_time() {
+    let text = fs::read_to_string(fixture("rose.gcode")).expect("fixture must exist");
+    let cmds = parse_all(&text).expect("must parse");
+    let result = gcode_sentinel::dialect::detect_dialect(&cmds, None);
+    assert!(
+        result.metadata.estimated_time_seconds.is_some(),
+        "OrcaSlicer fixture must have an estimated time"
+    );
+    let time = result.metadata.estimated_time_seconds.unwrap();
+    assert!(time > 0.0, "estimated time must be positive, got {time}");
 }

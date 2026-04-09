@@ -350,7 +350,7 @@ fn check_profile_conflicts(
     let slicer_nozzle = metadata.nozzle_diameter_mm;
 
     if let (Some(slicer_val), Some(profile_val)) = (slicer_nozzle, profile.nozzle_diameter_mm) {
-        if (slicer_val - profile_val).abs() > f64::EPSILON {
+        if (slicer_val - profile_val).abs() > 1e-4 {
             let line = find_metadata_line(commands, "nozzle_diameter");
             diagnostics.push(gcode_sentinel::diagnostics::Diagnostic {
                 severity: Severity::Warning,
@@ -370,12 +370,14 @@ fn find_metadata_line(
 ) -> u32 {
     for cmd in commands.iter().rev() {
         if let gcode_sentinel::models::GCodeCommand::Comment { text } = &cmd.inner {
-            if text.contains(key) {
-                return cmd.line;
+            if let Some((k, _)) = text.trim().split_once('=') {
+                if k.trim() == key {
+                    return cmd.line;
+                }
             }
         }
     }
-    1
+    0
 }
 
 fn write_output(

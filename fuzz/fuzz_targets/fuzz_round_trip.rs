@@ -14,9 +14,8 @@ fuzz_target!(|data: &[u8]| {
         Err(_) => return,
     };
     let mut buf = Vec::new();
-    if emit(&cmds, &mut buf, &EmitConfig::default()).is_err() {
-        return;
-    }
+    emit(&cmds, &mut buf, &EmitConfig::default())
+        .expect("emit to Vec<u8> should not fail");
     let text2 = match String::from_utf8(buf) {
         Ok(t) => t,
         Err(_) => return,
