@@ -228,7 +228,7 @@ pub fn detect_dialect(
             severity: Severity::Info,
             line: detection_line,
             code: "I004",
-            message: format!("slicer dialect detected: {dialect:?} (confidence: {confidence:?})",),
+            message: format!("slicer dialect detected: {dialect:?} (confidence: {confidence:?})"),
         });
     }
 
