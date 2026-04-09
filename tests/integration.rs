@@ -259,6 +259,7 @@ fn json_report_valid() {
         stats: analysis.stats,
         changes: opt.changes,
         dry_run: false,
+        slicer: None,
     };
 
     let json_str = serde_json::to_string(&report).expect("must serialize to JSON");
@@ -696,4 +697,105 @@ fn arc_fit_preserves_extrusion_on_existing_fixtures() {
             diff.new_errors
         );
     }
+}
+
+// ── CLI parsing ─────────────────────────────────────────────────────────────
+
+#[test]
+fn cli_dialect_flag_parsed() {
+    use clap::Parser;
+    use gcode_sentinel::cli::Cli;
+    let cli =
+        Cli::try_parse_from(["gcode-sentinel", "input.gcode", "--dialect", "orca-slicer"]).unwrap();
+    assert!(cli.dialect.is_some());
+}
+
+// ── Dialect detection ───────────────────────────────────────────────────────
+
+#[test]
+fn detect_dialect_malm_slide_is_orcaslicer() {
+    let text = fs::read_to_string(fixture("malm_slide.gcode"))
+        .expect("fixture malm_slide.gcode must exist");
+    let cmds = parse_all(&text).expect("malm_slide.gcode must parse");
+
+    let result = gcode_sentinel::dialect::detect_dialect(&cmds, None);
+    assert_eq!(
+        result.metadata.dialect,
+        gcode_sentinel::dialect::SlicerDialect::OrcaSlicer
+    );
+    assert_eq!(
+        result.metadata.confidence,
+        gcode_sentinel::dialect::Confidence::High
+    );
+    assert!(
+        result.metadata.slicer_version.is_some(),
+        "OrcaSlicer version should be extracted"
+    );
+    assert_eq!(result.metadata.nozzle_diameter_mm, Some(0.4));
+    assert_eq!(result.metadata.layer_height_mm, Some(0.2));
+    assert_eq!(result.metadata.filament_type.as_deref(), Some("PLA"));
+    assert_eq!(result.metadata.bed_temperature, Some(55.0));
+    assert_eq!(result.metadata.hotend_temperature, Some(210.0));
+    assert!(
+        result.metadata.estimated_time_seconds.is_some(),
+        "estimated time should be extracted"
+    );
+}
+
+#[test]
+fn detect_dialect_rose_is_orcaslicer() {
+    let text = fs::read_to_string(fixture("rose.gcode")).expect("fixture rose.gcode must exist");
+    let cmds = parse_all(&text).expect("rose.gcode must parse");
+
+    let result = gcode_sentinel::dialect::detect_dialect(&cmds, None);
+    assert_eq!(
+        result.metadata.dialect,
+        gcode_sentinel::dialect::SlicerDialect::OrcaSlicer
+    );
+    assert_eq!(
+        result.metadata.confidence,
+        gcode_sentinel::dialect::Confidence::High
+    );
+}
+
+#[test]
+fn detect_dialect_override_suppresses_w005() {
+    let text = fs::read_to_string(fixture("malm_slide.gcode")).expect("fixture must exist");
+    let cmds = parse_all(&text).expect("must parse");
+    let result = gcode_sentinel::dialect::detect_dialect(
+        &cmds,
+        Some(gcode_sentinel::dialect::SlicerDialect::PrusaSlicer),
+    );
+    // W005 should be suppressed for explicit overrides
+    assert!(result.diagnostics.iter().all(|d| d.code != "W005"));
+    // But I004 should still fire
+    assert!(result.diagnostics.iter().any(|d| d.code == "I004"));
+}
+
+// ── Time estimate extraction via detect_dialect ─────────────────────────────
+
+#[test]
+fn detect_dialect_malm_slide_extracts_estimated_time() {
+    let text = fs::read_to_string(fixture("malm_slide.gcode")).expect("fixture must exist");
+    let cmds = parse_all(&text).expect("must parse");
+    let result = gcode_sentinel::dialect::detect_dialect(&cmds, None);
+    assert!(
+        result.metadata.estimated_time_seconds.is_some(),
+        "OrcaSlicer fixture must have an estimated time"
+    );
+    let time = result.metadata.estimated_time_seconds.unwrap();
+    assert!(time > 0.0, "estimated time must be positive, got {time}");
+}
+
+#[test]
+fn detect_dialect_rose_extracts_estimated_time() {
+    let text = fs::read_to_string(fixture("rose.gcode")).expect("fixture must exist");
+    let cmds = parse_all(&text).expect("must parse");
+    let result = gcode_sentinel::dialect::detect_dialect(&cmds, None);
+    assert!(
+        result.metadata.estimated_time_seconds.is_some(),
+        "OrcaSlicer fixture must have an estimated time"
+    );
+    let time = result.metadata.estimated_time_seconds.unwrap();
+    assert!(time > 0.0, "estimated time must be positive, got {time}");
 }

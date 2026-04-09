@@ -46,6 +46,8 @@ toml = { version = "0.8", default-features = false, features = ["parse"] }
 [dev-dependencies]
 # Temporary files in tests — MIT OR Apache-2.0
 tempfile = "3"
+# Property-based testing — MIT OR Apache-2.0
+proptest = "1"
 
 [profile.release]
 opt-level = 3

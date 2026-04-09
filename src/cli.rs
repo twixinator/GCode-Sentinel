@@ -9,6 +9,25 @@ use std::path::PathBuf;
 use clap::Parser;
 use clap::ValueEnum;
 
+/// Slicer dialect for `--dialect` override.
+#[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
+pub enum CliDialect {
+    OrcaSlicer,
+    PrusaSlicer,
+    Cura,
+}
+
+impl CliDialect {
+    #[must_use]
+    pub fn to_slicer_dialect(self) -> crate::dialect::SlicerDialect {
+        match self {
+            Self::OrcaSlicer => crate::dialect::SlicerDialect::OrcaSlicer,
+            Self::PrusaSlicer => crate::dialect::SlicerDialect::PrusaSlicer,
+            Self::Cura => crate::dialect::SlicerDialect::Cura,
+        }
+    }
+}
+
 /// Output format for the analysis report written via `--report-file` or to
 /// stdout when used without `--report-file`.
 #[derive(Debug, Clone, Default, PartialEq, ValueEnum)]
@@ -173,6 +192,10 @@ pub struct Cli {
     /// defaults → `--config` file → `--machine` profile → explicit flags.
     #[arg(long, value_name = "PROFILE")]
     pub machine: Option<String>,
+
+    /// Override auto-detected slicer dialect.
+    #[arg(long, value_enum, value_name = "DIALECT")]
+    pub dialect: Option<CliDialect>,
 }
 
 impl Cli {

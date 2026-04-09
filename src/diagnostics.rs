@@ -164,6 +164,10 @@ pub struct AnalysisReport {
 
     /// Whether this was a dry-run (no output file written).
     pub dry_run: bool,
+
+    /// Slicer dialect and extracted metadata (if detection was run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slicer: Option<crate::dialect::SlicerMetadata>,
 }
 
 impl AnalysisReport {
@@ -199,6 +203,19 @@ impl AnalysisReport {
         writeln!(writer, "Est. time : {mins:.0} min")?;
         writeln!(writer, "Bbox min  : {}", self.stats.bbox_min)?;
         writeln!(writer, "Bbox max  : {}", self.stats.bbox_max)?;
+
+        if let Some(ref slicer) = self.slicer {
+            if slicer.dialect != crate::dialect::SlicerDialect::Unknown {
+                writeln!(
+                    writer,
+                    "Slicer    : {:?} ({:?})",
+                    slicer.dialect, slicer.confidence
+                )?;
+            }
+            if let Some(ref v) = slicer.slicer_version {
+                writeln!(writer, "Version   : {v}")?;
+            }
+        }
 
         if self.diagnostics.is_empty() {
             writeln!(writer, "\nNo issues found.")?;
@@ -311,6 +328,7 @@ mod tests {
             stats: PrintStats::default(),
             changes: vec![],
             dry_run: false,
+            slicer: None,
         };
         let json = serde_json::to_string(&report).unwrap();
         let val: serde_json::Value = serde_json::from_str(&json).unwrap();

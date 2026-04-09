@@ -1,0 +1,36 @@
+[package]
+name = "gcode-sentinel-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+gcode-sentinel = { path = ".." }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_parse"
+path = "fuzz_targets/fuzz_parse.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_round_trip"
+path = "fuzz_targets/fuzz_round_trip.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_optimize"
+path = "fuzz_targets/fuzz_optimize.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_detect_dialect"
+path = "fuzz_targets/fuzz_detect_dialect.rs"
+doc = false
